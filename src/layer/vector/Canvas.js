@@ -8,6 +8,11 @@ import {Bounds} from '../../geometry/Bounds.js';
 
 const DASH_SEPARATOR_RE = /[, ]+/;
 const BATCH_MAX_SIZE = 512;
+const BATCH_BAIL_PROBE = 64;
+const BATCH_KIND_POLY = 1;
+const BATCH_KIND_CIRCLE = 2;
+const REDRAW_PROMOTE_THRESHOLD = 0.25;
+const REDRAW_PROMOTE_CANDIDATE_THRESHOLD = 1500;
 const STOCK_POLYLINE_UPDATE_PATH = Polyline.prototype._updatePath;
 const STOCK_CIRCLE_MARKER_UPDATE_PATH = CircleMarker.prototype._updatePath;
 
@@ -253,12 +258,34 @@ export class Canvas extends Renderer {
 		if (this._redrawBounds) {
 			this._redrawBounds.min._floor();
 			this._redrawBounds.max._ceil();
+			this._maybePromoteRedrawBounds();
 		}
 
 		this._clear(); // clear layers in redraw bounds
 		this._draw(); // draw layers
 
 		this._redrawBounds = null;
+	}
+
+	_maybePromoteRedrawBounds() {
+		if (this._disableDirtyRectPromotion || !this._redrawBounds || !this._bounds) {
+			return;
+		}
+
+		const dirtySize = this._redrawBounds.getSize();
+		const canvasSize = this._bounds.getSize();
+		const dirtyArea = dirtySize.x * dirtySize.y;
+		const canvasArea = canvasSize.x * canvasSize.y;
+
+		if (canvasArea > 0 && dirtyArea / canvasArea >= REDRAW_PROMOTE_THRESHOLD) {
+			this._redrawBounds = null;
+			return;
+		}
+
+		const candidates = this._spatialGrid?.queryBounds(this._redrawBounds);
+		if (candidates && candidates.length >= REDRAW_PROMOTE_CANDIDATE_THRESHOLD) {
+			this._redrawBounds = null;
+		}
 	}
 
 	_clear() {
@@ -287,48 +314,64 @@ export class Canvas extends Renderer {
 
 		this._drawing = true;
 
-		let batch = null;
-		let pending = null;
+		let batchLayers = null;
+		let batchKinds = null;
+		let batchStyleKey = null;
+		let batchUnionBounds = null;
+		let pendingLayer = null;
+		let pendingKind = 0;
+		let pendingStyleKey = null;
+		let batchableProbeCount = 0;
+		let batchPairFormed = false;
+		let batchingDisabled = false;
 
-		const extendBatchUnionBounds = (target, pxBounds) => {
-			target.unionBounds = target.unionBounds ?
-				new Bounds(target.unionBounds).extend(pxBounds) :
+		const extendBatchUnionBounds = (pxBounds) => {
+			batchUnionBounds = batchUnionBounds ?
+				new Bounds(batchUnionBounds).extend(pxBounds) :
 				new Bounds(pxBounds.min, pxBounds.max);
 		};
 
 		const flushBatch = () => {
-			if (!batch?.layers.length) { return; }
+			if (!batchLayers?.length) { return; }
 
 			const ctx = this._ctx;
 			ctx.beginPath();
-			for (const item of batch.layers) {
-				if (item.kind === 'poly') {
-					this._appendPolyPath(item.layer, item.closed);
+			for (let i = 0; i < batchLayers.length; i++) {
+				const layer = batchLayers[i];
+				if (batchKinds[i] === BATCH_KIND_POLY) {
+					this._appendPolyPath(layer, false);
 				} else {
-					this._appendCirclePath(item.layer);
+					this._appendCirclePath(layer);
 				}
 			}
-			this._fillStroke(ctx, batch.layers[0].layer);
-			batch = null;
+			this._fillStroke(ctx, batchLayers[0]);
+			batchLayers = null;
+			batchKinds = null;
+			batchStyleKey = null;
+			batchUnionBounds = null;
 		};
 
 		const drawPending = () => {
-			if (!pending) { return; }
-			pending.item.layer._updatePath();
-			pending = null;
+			if (!pendingLayer) { return; }
+			pendingLayer._updatePath();
+			pendingLayer = null;
+			pendingKind = 0;
+			pendingStyleKey = null;
 		};
 
-		const startBatch = (first, second, styleKey) => {
-			batch = {
-				styleKey,
-				layers: [first, second],
-				unionBounds: null
-			};
-			for (const item of batch.layers) {
-				const pxBounds = item.layer._pxBounds;
-				if (pxBounds) {
-					extendBatchUnionBounds(batch, pxBounds);
-				}
+		const startBatch = (firstLayer, firstKind, secondLayer, secondKind, styleKey) => {
+			batchPairFormed = true;
+			batchLayers = [firstLayer, secondLayer];
+			batchKinds = [firstKind, secondKind];
+			batchStyleKey = styleKey;
+			batchUnionBounds = null;
+			const firstBounds = firstLayer._pxBounds;
+			const secondBounds = secondLayer._pxBounds;
+			if (firstBounds) {
+				extendBatchUnionBounds(firstBounds);
+			}
+			if (secondBounds) {
+				extendBatchUnionBounds(secondBounds);
 			}
 		};
 
@@ -337,13 +380,22 @@ export class Canvas extends Renderer {
 				return;
 			}
 
-			if (this._disablePathBatching) {
+			if (this._disablePathBatching || batchingDisabled) {
 				layer._updatePath();
 				return;
 			}
 
-			const item = this._getLayerBatchItem(layer);
-			if (!item) {
+			const kind = this._getLayerBatchKind(layer);
+			if (kind === 0) {
+				flushBatch();
+				drawPending();
+				layer._updatePath();
+				return;
+			}
+
+			batchableProbeCount++;
+			if (!batchPairFormed && batchableProbeCount > BATCH_BAIL_PROBE) {
+				batchingDisabled = true;
 				flushBatch();
 				drawPending();
 				layer._updatePath();
@@ -352,31 +404,36 @@ export class Canvas extends Renderer {
 
 			const styleKey = this._getBatchStyleKey(layer);
 
-			if (batch) {
-				if (!this._batchStyleKeysEqual(batch.styleKey, styleKey) ||
-					batch.layers.length >= BATCH_MAX_SIZE ||
-					this._batchBoundsOverlap(batch, layer)) {
+			if (batchLayers) {
+				if (!this._batchStyleKeysEqual(batchStyleKey, styleKey) ||
+					batchLayers.length >= BATCH_MAX_SIZE ||
+					this._batchBoundsOverlap(batchLayers, batchUnionBounds, layer)) {
 					flushBatch();
 				} else {
-					batch.layers.push(item);
+					batchLayers.push(layer);
+					batchKinds.push(kind);
 					if (layer._pxBounds) {
-						extendBatchUnionBounds(batch, layer._pxBounds);
+						extendBatchUnionBounds(layer._pxBounds);
 					}
 					return;
 				}
 			}
 
-			if (pending) {
-				if (this._batchStyleKeysEqual(pending.styleKey, styleKey) &&
-					!this._pxBoundsOverlap(pending.item.layer._pxBounds, layer._pxBounds)) {
-					startBatch(pending.item, item, styleKey);
-					pending = null;
+			if (pendingLayer) {
+				if (this._batchStyleKeysEqual(pendingStyleKey, styleKey) &&
+					!this._pxBoundsOverlap(pendingLayer._pxBounds, layer._pxBounds)) {
+					startBatch(pendingLayer, pendingKind, layer, kind, styleKey);
+					pendingLayer = null;
+					pendingKind = 0;
+					pendingStyleKey = null;
 					return;
 				}
 				drawPending();
 			}
 
-			pending = {item, styleKey};
+			pendingLayer = layer;
+			pendingKind = kind;
+			pendingStyleKey = styleKey;
 		};
 
 		if (candidates) {
@@ -441,15 +498,15 @@ export class Canvas extends Renderer {
 		return true;
 	}
 
-	_getLayerBatchItem(layer) {
+	_getLayerBatchKind(layer) {
 		const updatePath = layer._updatePath;
 		if (updatePath === STOCK_POLYLINE_UPDATE_PATH) {
-			return {layer, kind: 'poly', closed: false};
+			return BATCH_KIND_POLY;
 		}
 		if (updatePath === STOCK_CIRCLE_MARKER_UPDATE_PATH && !this._isEllipseCircle(layer)) {
-			return {layer, kind: 'circle'};
+			return BATCH_KIND_CIRCLE;
 		}
-		return null;
+		return 0;
 	}
 
 	_isEllipseCircle(layer) {
@@ -465,13 +522,13 @@ export class Canvas extends Renderer {
 		return a.intersects(b);
 	}
 
-	_batchBoundsOverlap(batch, layer) {
+	_batchBoundsOverlap(batchLayers, batchUnionBounds, layer) {
 		const pxBounds = layer._pxBounds;
-		if (!pxBounds || !batch.layers.length) { return false; }
+		if (!pxBounds || !batchLayers.length) { return false; }
 
-		if (batch.unionBounds && pxBounds.intersects(batch.unionBounds)) {
-			for (const item of batch.layers) {
-				const memberBounds = item.layer._pxBounds;
+		if (batchUnionBounds && pxBounds.intersects(batchUnionBounds)) {
+			for (const member of batchLayers) {
+				const memberBounds = member._pxBounds;
 				if (memberBounds && pxBounds.intersects(memberBounds)) {
 					return true;
 				}
