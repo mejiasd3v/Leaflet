@@ -1,6 +1,7 @@
 import {Renderer} from './Renderer.js';
 import {CanvasSpatialGrid} from './CanvasSpatialGrid.js';
 import {Polyline} from './Polyline.js';
+import {Polygon} from './Polygon.js';
 import {CircleMarker} from './CircleMarker.js';
 import * as DomEvent from '../../dom/DomEvent.js';
 import * as Util from '../../core/Util.js';
@@ -17,6 +18,10 @@ const REDRAW_PROMOTE_CANDIDATE_THRESHOLD = 1500;
 const PAN_STRIP_PADDING = 32;
 const STOCK_POLYLINE_UPDATE_PATH = Polyline.prototype._updatePath;
 const STOCK_CIRCLE_MARKER_UPDATE_PATH = CircleMarker.prototype._updatePath;
+const STOCK_POLYLINE_UPDATE = Polyline.prototype._update;
+const STOCK_POLYLINE_CLIP = Polyline.prototype._clipPoints;
+const STOCK_POLYGON_CLIP = Polygon.prototype._clipPoints;
+const STOCK_CIRCLE_MARKER_UPDATE = CircleMarker.prototype._update;
 /*
  * @class Canvas
  * @inherits Renderer
@@ -140,7 +145,9 @@ export class Canvas extends Renderer {
 			if (expandedStrip) {
 				const expandedStrips = [expandedStrip];
 				for (const layer of Object.values(this._layers)) {
-					layer._update();
+					if (!this._shouldSkipLayerUpdateOnPan(layer, panBlit.oldBounds, panBlit.newBounds, expandedStrips)) {
+						layer._update();
+					}
 				}
 				this._redrawPanStrips(expandedStrips);
 			}
@@ -421,6 +428,22 @@ export class Canvas extends Renderer {
 		this._ctx.restore();
 	}
 
+	_canClipSkipOnPan(layer) {
+		if (this._disableClipSkip) { return false; }
+
+		const update = layer._update;
+		if (update === STOCK_CIRCLE_MARKER_UPDATE) {
+			return true;
+		}
+
+		if (update !== STOCK_POLYLINE_UPDATE) {
+			return false;
+		}
+
+		const clip = layer._clipPoints;
+		return clip === STOCK_POLYLINE_CLIP || clip === STOCK_POLYGON_CLIP;
+	}
+
 	_unionPanStrips(strips) {
 		let union = null;
 		for (const strip of strips) {
@@ -458,6 +481,24 @@ export class Canvas extends Renderer {
 		expanded.max.y = Math.min(expanded.max.y, view.max.y);
 
 		return expanded;
+	}
+
+	_shouldSkipLayerUpdateOnPan(layer, oldBounds, newBounds, expandedStrips) {
+		if (!this._canClipSkipOnPan(layer) || !layer._pxBounds) {
+			return false;
+		}
+
+		if (!oldBounds.contains(layer._pxBounds) || !newBounds.contains(layer._pxBounds)) {
+			return false;
+		}
+
+		for (const strip of expandedStrips) {
+			if (layer._pxBounds.intersects(strip)) {
+				return false;
+			}
+		}
+
+		return true;
 	}
 
 	_maybePromoteRedrawBounds() {
