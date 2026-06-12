@@ -15,7 +15,6 @@ const BATCH_KIND_POLY = 1;
 const BATCH_KIND_CIRCLE = 2;
 const REDRAW_PROMOTE_THRESHOLD = 0.25;
 const REDRAW_PROMOTE_CANDIDATE_THRESHOLD = 1500;
-const PAN_STRIP_PADDING = 32;
 const STOCK_POLYLINE_UPDATE_PATH = Polyline.prototype._updatePath;
 const STOCK_CIRCLE_MARKER_UPDATE_PATH = CircleMarker.prototype._updatePath;
 const STOCK_POLYLINE_UPDATE = Polyline.prototype._update;
@@ -139,18 +138,14 @@ export class Canvas extends Renderer {
 
 		const panBlit = this._getPanBlitState();
 		if (panBlit) {
-			const stripUnion = this._unionPanStrips(panBlit.strips);
-			const expandedStrip = stripUnion ? this._expandPanStrip(stripUnion) : null;
 			this._blitPan(panBlit.delta);
-			if (expandedStrip) {
-				const expandedStrips = [expandedStrip];
-				for (const layer of Object.values(this._layers)) {
-					if (!this._shouldSkipLayerUpdateOnPan(layer, panBlit.oldBounds, panBlit.newBounds, expandedStrips)) {
-						layer._update();
-					}
+			for (const layer of Object.values(this._layers)) {
+				if (!this._shouldSkipLayerUpdateOnPan(layer, panBlit.oldBounds, panBlit.newBounds)) {
+					layer._update();
+					this._spatialGrid?.reindex(layer);
 				}
-				this._redrawPanStrips(expandedStrips);
 			}
+			this._redrawPanStrips(panBlit.strips);
 			this._saveSettleState();
 			return;
 		}
@@ -300,8 +295,6 @@ export class Canvas extends Renderer {
 
 	_redrawPanStrips(strips) {
 		this._panStripRedraw = true;
-		const batchingDisabled = this._disablePathBatching;
-		this._disablePathBatching = true;
 		try {
 			for (const strip of strips) {
 				this._redrawBounds = strip;
@@ -312,7 +305,6 @@ export class Canvas extends Renderer {
 				this._draw();
 			}
 		} finally {
-			this._disablePathBatching = batchingDisabled;
 			this._panStripRedraw = false;
 			this._redrawBounds = null;
 		}
@@ -412,19 +404,12 @@ export class Canvas extends Renderer {
 		const w = this._container.width;
 		const h = this._container.height;
 
-		let buffer = this._panBlitBuffer;
-		if (!buffer || buffer.width !== w || buffer.height !== h) {
-			buffer = this._panBlitBuffer = document.createElement('canvas');
-			buffer.width = w;
-			buffer.height = h;
-		}
-
-		buffer.getContext('2d').drawImage(this._container, 0, 0, w, h);
-
 		this._ctx.save();
 		this._ctx.setTransform(1, 0, 0, 1, 0, 0);
-		this._ctx.clearRect(0, 0, w, h);
-		this._ctx.drawImage(buffer, 0, 0, w, h, ox, oy, w, h);
+		// Same-canvas blit: spec snapshots source before compositing.
+		// Use 'copy' so overlap replaces stale pixels without a full-canvas clear.
+		this._ctx.globalCompositeOperation = 'copy';
+		this._ctx.drawImage(this._container, 0, 0, w, h, ox, oy, w, h);
 		this._ctx.restore();
 	}
 
@@ -444,61 +429,12 @@ export class Canvas extends Renderer {
 		return clip === STOCK_POLYLINE_CLIP || clip === STOCK_POLYGON_CLIP;
 	}
 
-	_unionPanStrips(strips) {
-		let union = null;
-		for (const strip of strips) {
-			union = union ?
-				new Bounds(union).extend(strip) :
-				new Bounds(strip.min, strip.max);
-		}
-		return union;
-	}
-
-	_expandPanStrip(strip) {
-		const view = this._bounds;
-		const expanded = new Bounds(
-			new Point(
-				Math.max(strip.min.x - PAN_STRIP_PADDING, view.min.x),
-				Math.max(strip.min.y - PAN_STRIP_PADDING, view.min.y)
-			),
-			new Point(
-				Math.min(strip.max.x + PAN_STRIP_PADDING, view.max.x),
-				Math.min(strip.max.y + PAN_STRIP_PADDING, view.max.y)
-			)
-		);
-
-		// Include full bounds of every layer touching the strip so translucent
-		// stacks composite with the same underpaint a full redraw would use.
-		for (const layer of Object.values(this._layers)) {
-			if (layer._pxBounds?.intersects(strip)) {
-				expanded.extend(layer._pxBounds);
-			}
-		}
-
-		expanded.min.x = Math.max(expanded.min.x, view.min.x);
-		expanded.min.y = Math.max(expanded.min.y, view.min.y);
-		expanded.max.x = Math.min(expanded.max.x, view.max.x);
-		expanded.max.y = Math.min(expanded.max.y, view.max.y);
-
-		return expanded;
-	}
-
-	_shouldSkipLayerUpdateOnPan(layer, oldBounds, newBounds, expandedStrips) {
+	_shouldSkipLayerUpdateOnPan(layer, oldBounds, newBounds) {
 		if (!this._canClipSkipOnPan(layer) || !layer._pxBounds) {
 			return false;
 		}
 
-		if (!oldBounds.contains(layer._pxBounds) || !newBounds.contains(layer._pxBounds)) {
-			return false;
-		}
-
-		for (const strip of expandedStrips) {
-			if (layer._pxBounds.intersects(strip)) {
-				return false;
-			}
-		}
-
-		return true;
+		return oldBounds.contains(layer._pxBounds) && newBounds.contains(layer._pxBounds);
 	}
 
 	_maybePromoteRedrawBounds() {
@@ -538,9 +474,7 @@ export class Canvas extends Renderer {
 
 	_draw() {
 		const bounds = this._redrawBounds;
-		const candidates = this._panStripRedraw ?
-			null :
-			this._spatialGrid?.queryBounds(bounds);
+		const candidates = this._spatialGrid?.queryBounds(bounds);
 		this._ctx.save();
 		if (bounds) {
 			const size = bounds.getSize();
