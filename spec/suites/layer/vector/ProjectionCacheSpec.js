@@ -77,6 +77,22 @@ describe('Polyline projection cache', () => {
 		expectRingsEqual(polyline._rings, expectedRings(map, polyline._latlngs));
 	});
 
+	it('does not leave a ghost ring when setLatLngs shrinks a multi-polyline', () => {
+		const multiLatLngs = [
+			[[55.8, 37.6], [55.9, 38.0]],
+			[[56.0, 38.5], [56.1, 39.0]]
+		];
+		const singleLatLngs = [[50.0, 30.0], [51.0, 31.0]];
+		const polyline = new Polyline(multiLatLngs).addTo(map);
+
+		expect(polyline._rings.length).to.equal(2);
+
+		polyline.setLatLngs(singleLatLngs);
+
+		expect(polyline._rings.length).to.equal(1);
+		expectRingsEqual(polyline._rings, expectedRings(map, singleLatLngs));
+	});
+
 	it('rebuilds the cache when moved to a map with a different CRS', () => {
 		const latlngs = [[10, 10], [20, 20], [30, 10]];
 		const polyline = new Polyline(latlngs).addTo(map);

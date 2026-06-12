@@ -223,7 +223,8 @@ export class Polyline extends Path {
 		}
 
 		let ringIdx = 0;
-		return this._ringsStructureMatchesRecursive(rings, latlngs, () => ringIdx++).match;
+		const result = this._ringsStructureMatchesRecursive(rings, latlngs, () => ringIdx++);
+		return result.match && ringIdx === rings.length;
 	}
 
 	_ringsStructureMatchesRecursive(rings, latlngs, nextRingIdx) {
