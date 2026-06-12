@@ -76,6 +76,7 @@ export class Canvas extends Renderer {
 	onAdd(map) {
 		this._spatialGrid ??= new CanvasSpatialGrid();
 		this._spatialIndexDirty = true;
+		this._panPxDrift = new Point(0, 0);
 
 		super.onAdd(map);
 
@@ -138,20 +139,63 @@ export class Canvas extends Renderer {
 
 		const panBlit = this._getPanBlitState();
 		if (panBlit) {
+			const profile = this._profilePanBlit;
+			let t = profile ? performance.now() : 0;
+
 			this._blitPan(panBlit.delta);
+			const blitMs = profile ? performance.now() - t : 0;
+
+			let scanUpdateMs = 0;
+			let reindexMs = 0;
+			let projectedLayerCount = 0;
 			for (const layer of Object.values(this._layers)) {
-				if (!this._shouldSkipLayerUpdateOnPan(layer, panBlit.oldBounds, panBlit.newBounds)) {
-					layer._update();
+				if (!this._shouldSkipLayerUpdateOnPan(layer, panBlit.oldBounds, panBlit.newBounds, panBlit.delta)) {
+					projectedLayerCount++;
+					if (profile) { t = performance.now(); }
+					layer._project();
+					this._syncLayerPxPanDrift(layer);
+					if (profile) { scanUpdateMs += performance.now() - t; }
+					if (profile) { t = performance.now(); }
 					this._spatialGrid?.reindex(layer);
+					if (profile) { reindexMs += performance.now() - t; }
+				}
+			}
+
+			this._panStripDelta = panBlit.delta;
+
+			if (profile) { t = performance.now(); }
+			let stripCandidateCount = 0;
+			if (profile) {
+				for (const strip of panBlit.strips) {
+					stripCandidateCount += this._getStripCandidates(strip).length;
 				}
 			}
 			this._redrawPanStrips(panBlit.strips);
+			const stripMs = profile ? performance.now() - t : 0;
+
+			this._panPxDrift = (this._panPxDrift || new Point(0, 0)).add(panBlit.delta);
+			this._panStripDelta = null;
+
+			if (profile) {
+				this._lastPanBlitProfile = {
+					blitMs,
+					scanUpdateMs,
+					reindexMs,
+					stripMs,
+					stripCandidateCount,
+					projectedLayerCount,
+					panBlitUsed: true
+				};
+			}
+
 			this._saveSettleState();
 			return;
 		}
 
+		this._panPxDrift = new Point(0, 0);
 		this._redrawBounds = null;
 		for (const layer of Object.values(this._layers)) {
+			layer._pxPanSyncDrift = new Point(0, 0);
 			layer._update();
 		}
 
@@ -192,6 +236,7 @@ export class Canvas extends Renderer {
 	_initPath(layer) {
 		this._updateDashArray(layer);
 		this._invalidateBatchStyleKey(layer);
+		layer._pxPanSyncDrift = new Point(0, 0);
 		this._layers[Util.stamp(layer)] = layer;
 
 		const order = layer._order = {
@@ -297,17 +342,182 @@ export class Canvas extends Renderer {
 		this._panStripRedraw = true;
 		try {
 			for (const strip of strips) {
-				this._redrawBounds = strip;
-				this._redrawBounds.min._floor();
-				this._redrawBounds.max._ceil();
-				this._maybePromoteRedrawBounds();
-				this._clear();
-				this._draw();
+				this._redrawPanStrip(strip);
 			}
 		} finally {
 			this._panStripRedraw = false;
 			this._redrawBounds = null;
 		}
+	}
+
+	_getStripCandidates(strip) {
+		if (this._panStripRedraw) {
+			const panDelta = this._panStripDelta;
+			const drift = this._panPxDrift || new Point(0, 0);
+			const queryOffset = new Point(drift.x + (panDelta?.x || 0), drift.y + (panDelta?.y || 0));
+			const queryStrip = queryOffset.x || queryOffset.y ?
+				new Bounds(strip.min.subtract(queryOffset), strip.max.subtract(queryOffset)) :
+				strip;
+			const indexed = this._spatialGrid?.queryBounds(queryStrip);
+			const pool = indexed?.length ? indexed : this._getAllLayerCandidates();
+			const candidates = [];
+
+			for (let i = 0; i < pool.length; i++) {
+				const layer = pool[i];
+				const pxBounds = this._shiftLayerPxBounds(layer, panDelta);
+				if (pxBounds?.intersects(strip)) {
+					candidates.push(layer);
+				}
+			}
+			return candidates;
+		}
+
+		const indexed = this._spatialGrid?.queryBounds(strip);
+		if (indexed?.length) {
+			const candidates = [];
+			for (let i = 0; i < indexed.length; i++) {
+				const layer = indexed[i];
+				if (layer._pxBounds?.intersects(strip)) {
+					candidates.push(layer);
+				}
+			}
+			if (candidates.length) {
+				return candidates;
+			}
+		}
+
+		const candidates = [];
+		for (let order = this._drawFirst; order; order = order.next) {
+			const layer = order.layer;
+			if (layer._pxBounds?.intersects(strip)) {
+				candidates.push(layer);
+			}
+		}
+		return candidates;
+	}
+
+	_shiftLayerPxBounds(layer, extraDelta) {
+		const pxBounds = layer._pxBounds;
+		if (!pxBounds) { return null; }
+
+		const drift = this._panPxDrift || new Point(0, 0);
+		const sync = layer._pxPanSyncDrift || new Point(0, 0);
+		const offset = new Point(
+			drift.x - sync.x + (extraDelta?.x || 0),
+			drift.y - sync.y + (extraDelta?.y || 0)
+		);
+
+		if (offset.x === 0 && offset.y === 0) {
+			return pxBounds;
+		}
+
+		return new Bounds(
+			pxBounds.min.add(offset),
+			pxBounds.max.add(offset)
+		);
+	}
+
+	_syncLayerPxPanDrift(layer) {
+		layer._pxPanSyncDrift = this._panPxDrift ?
+			this._panPxDrift.clone() :
+			new Point(0, 0);
+	}
+
+	_getAllLayerCandidates() {
+		const candidates = [];
+		for (let order = this._drawFirst; order; order = order.next) {
+			candidates.push(order.layer);
+		}
+		return candidates;
+	}
+
+	_layerNeedsStripClip(layer, strip) {
+		const pxBounds = this._panStripRedraw ?
+			this._shiftLayerPxBounds(layer, this._panStripDelta) :
+			layer._pxBounds;
+		return !pxBounds || !strip.contains(pxBounds);
+	}
+
+	_stripInsiderCrosserUnionsOverlap(strip, candidates) {
+		let insiderUnion = null;
+		let crosserUnion = null;
+
+		for (const layer of candidates) {
+			const pxBounds = this._panStripRedraw ?
+				this._shiftLayerPxBounds(layer, this._panStripDelta) :
+				layer._pxBounds;
+			if (!pxBounds?.intersects(strip)) {
+				continue;
+			}
+
+			if (strip.contains(pxBounds)) {
+				insiderUnion = insiderUnion ?
+					new Bounds(insiderUnion).extend(pxBounds) :
+					new Bounds(pxBounds.min, pxBounds.max);
+			} else {
+				crosserUnion = crosserUnion ?
+					new Bounds(crosserUnion).extend(pxBounds) :
+					new Bounds(pxBounds.min, pxBounds.max);
+			}
+		}
+
+		if (!insiderUnion || !crosserUnion) {
+			return false;
+		}
+
+		return insiderUnion.intersects(crosserUnion);
+	}
+
+	_redrawPanStrip(strip) {
+		this._redrawBounds = strip;
+		this._redrawBounds.min._floor();
+		this._redrawBounds.max._ceil();
+		this._maybePromoteRedrawBounds();
+		this._clear();
+
+		const experiment = this._panStripDrawExperiment;
+		if (experiment === 'clip') {
+			this._executeDraw(strip, this._getStripCandidates(strip), true);
+			return;
+		}
+		if (experiment === 'no-clip-same') {
+			this._executeDraw(strip, this._getStripCandidates(strip), false);
+			return;
+		}
+		if (experiment === 'no-clip-full') {
+			this._executeDraw(null, this._getAllLayerCandidates(), false);
+			return;
+		}
+
+		const candidates = this._getStripCandidates(strip);
+		if (this._disableStripClipSplit || this._stripInsiderCrosserUnionsOverlap(strip, candidates)) {
+			this._executeDraw(strip, candidates, true);
+			return;
+		}
+
+		this._executeDrawStripClipRuns(strip, candidates);
+	}
+
+	_executeDrawStripClipRuns(strip, candidates) {
+		let run = [];
+		let runClip = null;
+
+		const flushRun = () => {
+			if (!run.length) { return; }
+			this._executeDraw(strip, run, runClip);
+			run = [];
+		};
+
+		for (const layer of candidates) {
+			const needsClip = this._layerNeedsStripClip(layer, strip);
+			if (runClip !== null && needsClip !== runClip) {
+				flushRun();
+			}
+			runClip = needsClip;
+			run.push(layer);
+		}
+
+		flushRun();
 	}
 
 	_saveSettleState() {
@@ -429,12 +639,15 @@ export class Canvas extends Renderer {
 		return clip === STOCK_POLYLINE_CLIP || clip === STOCK_POLYGON_CLIP;
 	}
 
-	_shouldSkipLayerUpdateOnPan(layer, oldBounds, newBounds) {
+	_shouldSkipLayerUpdateOnPan(layer, oldBounds, newBounds, panDelta) {
 		if (!this._canClipSkipOnPan(layer) || !layer._pxBounds) {
 			return false;
 		}
 
-		return oldBounds.contains(layer._pxBounds) && newBounds.contains(layer._pxBounds);
+		const effectiveOld = this._shiftLayerPxBounds(layer);
+		const effectiveNew = this._shiftLayerPxBounds(layer, panDelta);
+		return effectiveOld && effectiveNew &&
+			oldBounds.contains(effectiveOld) && newBounds.contains(effectiveNew);
 	}
 
 	_maybePromoteRedrawBounds() {
@@ -475,8 +688,12 @@ export class Canvas extends Renderer {
 	_draw() {
 		const bounds = this._redrawBounds;
 		const candidates = this._spatialGrid?.queryBounds(bounds);
+		this._executeDraw(bounds, candidates, !!bounds);
+	}
+
+	_executeDraw(bounds, candidates, useClip) {
 		this._ctx.save();
-		if (bounds) {
+		if (useClip && bounds) {
 			const size = bounds.getSize();
 			this._ctx.beginPath();
 			this._ctx.rect(bounds.min.x, bounds.min.y, size.x, size.y);
@@ -547,7 +764,10 @@ export class Canvas extends Renderer {
 		};
 
 		const drawLayer = (layer) => {
-			if (bounds && (!layer._pxBounds || !layer._pxBounds.intersects(bounds))) {
+			const pxBounds = this._panStripRedraw ?
+				this._shiftLayerPxBounds(layer, this._panStripDelta) :
+				layer._pxBounds;
+			if (bounds && (!pxBounds || !pxBounds.intersects(bounds))) {
 				return;
 			}
 

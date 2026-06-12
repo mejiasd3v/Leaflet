@@ -104,13 +104,13 @@ function interleavedPanBench(label, map, panOffset, samples) {
 	for (let i = 0; i < WARMUP + samples * 2; i++) {
 		const measure = i >= WARMUP;
 		const enabled = i % 2 === 0;
-		const flip = i % 2 === 0 ? 1 : -1;
+		const flip = Math.floor(i / 2) % 2 === 0 ? 1 : -1;
 
 		setPanBlitFlags(map._renderer, enabled);
 
 		const start = performance.now();
 		map.panBy([panOffset[0] * flip, panOffset[1] * flip], {animate: false});
-		const elapsed = performance.now() - start;
+		const elapsed = Math.max(performance.now() - start, 0.001);
 
 		if (measure) {
 			(enabled ? enabledTimes : disabledTimes).push(elapsed);
@@ -219,7 +219,7 @@ describe('Canvas pan blit benchmark', () => {
 			const start = performance.now();
 			map.setZoom(zoomB, {animate: false});
 			map.setZoom(zoomA, {animate: false});
-			const elapsed = performance.now() - start;
+			const elapsed = Math.max(performance.now() - start, 0.001);
 
 			if (measure) {
 				(enabled ? enabledTimes : disabledTimes).push(elapsed);
