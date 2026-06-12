@@ -59,9 +59,10 @@ export class Canvas extends Renderer {
 	}
 
 	onAdd(map) {
-		super.onAdd(map);
-
 		this._spatialGrid ??= new CanvasSpatialGrid();
+		this._spatialIndexDirty = true;
+
+		super.onAdd(map);
 
 		// Redraw vectors since canvas is cleared upon removal,
 		// in case of removing the renderer itself from the map.
@@ -103,6 +104,11 @@ export class Canvas extends Renderer {
 
 	_onZoomEnd() {
 		super._onZoomEnd();
+		this._spatialIndexDirty = true;
+	}
+
+	_onViewReset() {
+		super._onViewReset();
 		this._spatialIndexDirty = true;
 	}
 
@@ -421,6 +427,8 @@ export class Canvas extends Renderer {
 		this._map._fireDOMEvent(e, type || e.type, layers);
 	}
 
+	// Indexed candidates are sorted ascending by _order.seq, which must stay in
+	// sync with linked-list draw order; the last matching layer is topmost.
 	_findInteractiveLayerAt(point, accept) {
 		const candidates = this._spatialGrid?.queryPoint(point);
 		let topmost;

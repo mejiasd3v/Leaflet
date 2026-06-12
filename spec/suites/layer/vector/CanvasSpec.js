@@ -1,5 +1,6 @@
 import {expect} from 'chai';
-import {Canvas, Circle, CircleMarker, DomEvent, LayerGroup, LeafletMap, Marker, Polygon, Polyline, SVG, Util} from 'leaflet';
+import {Canvas, Circle, CircleMarker, DomEvent, LayerGroup, LatLng, LeafletMap, Marker, Polygon, Polyline, SVG, Util} from 'leaflet';
+import {BYPASS_THRESHOLD, CELL_SIZE} from '../../../../src/layer/vector/CanvasSpatialGrid.js';
 import Hand from 'prosthetic-hand';
 import sinon from 'sinon';
 import UIEventSimulator from 'ui-event-simulator';
@@ -390,6 +391,48 @@ describe('Canvas', () => {
 				expect(spy.callCount).to.eql(1);
 				done();
 			});
+		});
+
+		it('hit-tests correctly immediately after viewreset', () => {
+			const targetLatLng = [0, 0];
+			const target = new CircleMarker(targetLatLng, {radius: 20});
+
+			for (let i = 0; i < BYPASS_THRESHOLD; i++) {
+				new CircleMarker([(i + 1) * 0.5, (i + 1) * 0.5], {radius: 4}).addTo(map);
+			}
+			target.addTo(map);
+
+			const canvas = map.getRenderer(target);
+			expect(canvas._spatialGrid.usesIndex()).to.be.true;
+
+			const centerBefore = target._pxBounds.getCenter();
+			const cellBefore = Math.floor(centerBefore.x / CELL_SIZE);
+			const rebuildSpy = sinon.spy(canvas._spatialGrid, 'rebuild');
+
+			cancelAnimationFrame(canvas._redrawRequest);
+			canvas._redrawRequest = null;
+			map._resetView(new LatLng(1, 1), 10);
+
+			const centerAfter = target._pxBounds.getCenter();
+			const cellAfter = Math.floor(centerAfter.x / CELL_SIZE);
+			expect(centerAfter.equals(centerBefore)).to.be.false;
+			expect(cellAfter).to.not.equal(cellBefore);
+			expect(rebuildSpy.called).to.be.true;
+
+			const spy = sinon.spy();
+			target.on('click', spy);
+			const pt = map.latLngToContainerPoint(targetLatLng);
+			UIEventSimulator.fire('click', canvas._container, {
+				clientX: pt.x,
+				clientY: pt.y,
+				screenX: pt.x,
+				screenY: pt.y,
+				which: 1,
+				button: 0
+			});
+			expect(spy.callCount).to.eql(1);
+
+			rebuildSpy.restore();
 		});
 	});
 
