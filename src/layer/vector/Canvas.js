@@ -127,6 +127,7 @@ export class Canvas extends Renderer {
 
 		this._redrawBounds = null;
 		for (const layer of Object.values(this._layers)) {
+			this._invalidatePath2D(layer);
 			layer._update();
 		}
 
@@ -185,6 +186,8 @@ export class Canvas extends Renderer {
 	}
 
 	_removePath(layer) {
+		this._invalidatePath2D(layer);
+
 		const order = layer._order;
 		const next = order.next;
 		const prev = order.prev;
@@ -212,6 +215,7 @@ export class Canvas extends Renderer {
 		// Redraw the union of the layer's old pixel
 		// bounds and the new pixel bounds.
 		this._extendRedrawBounds(layer);
+		this._invalidatePath2D(layer);
 		layer._project();
 		layer._update();
 		this._spatialGrid?.reindex(layer);
@@ -335,16 +339,44 @@ export class Canvas extends Renderer {
 			if (!batchLayers?.length) { return; }
 
 			const ctx = this._ctx;
-			ctx.beginPath();
-			for (let i = 0; i < batchLayers.length; i++) {
-				const layer = batchLayers[i];
-				if (batchKinds[i] === BATCH_KIND_POLY) {
-					this._appendPolyPath(layer, false);
-				} else {
-					this._appendCirclePath(layer);
+			if (!this._disablePath2DCache && this._batchCanUsePath2D(batchLayers)) {
+				const batchPath = new Path2D();
+				let allCached = true;
+				for (let i = 0; i < batchLayers.length; i++) {
+					if (!batchLayers[i]._path2d) {
+						allCached = false;
+						break;
+					}
 				}
+				if (allCached) {
+					for (let i = 0; i < batchLayers.length; i++) {
+						batchPath.addPath(batchLayers[i]._path2d);
+					}
+				} else {
+					for (let i = 0; i < batchLayers.length; i++) {
+						const layer = batchLayers[i];
+						const kind = batchKinds[i];
+						if (kind === BATCH_KIND_POLY) {
+							this._buildPolyPath2D(layer, batchPath, false);
+						} else {
+							this._buildCirclePath2D(layer, batchPath);
+						}
+						this._ensurePath2D(layer, kind, kind === BATCH_KIND_POLY ? false : undefined);
+					}
+				}
+				this._fillStroke(ctx, batchLayers[0], batchPath);
+			} else {
+				ctx.beginPath();
+				for (let i = 0; i < batchLayers.length; i++) {
+					const layer = batchLayers[i];
+					if (batchKinds[i] === BATCH_KIND_POLY) {
+						this._appendPolyPath(layer, false);
+					} else {
+						this._appendCirclePath(layer);
+					}
+				}
+				this._fillStroke(ctx, batchLayers[0]);
 			}
-			this._fillStroke(ctx, batchLayers[0]);
 			batchLayers = null;
 			batchKinds = null;
 			batchStyleKey = null;
@@ -537,6 +569,81 @@ export class Canvas extends Renderer {
 		return false;
 	}
 
+	_invalidatePath2D(layer) {
+		delete layer._path2d;
+	}
+
+	_canUsePath2DCache(layer) {
+		const updatePath = layer._updatePath;
+		if (updatePath !== STOCK_POLYLINE_UPDATE_PATH &&
+			updatePath !== STOCK_CIRCLE_MARKER_UPDATE_PATH) {
+			return false;
+		}
+		if (updatePath === STOCK_CIRCLE_MARKER_UPDATE_PATH && this._isEllipseCircle(layer)) {
+			return false;
+		}
+		return true;
+	}
+
+	_batchCanUsePath2D(batchLayers) {
+		for (let i = 0; i < batchLayers.length; i++) {
+			if (!this._canUsePath2DCache(batchLayers[i])) {
+				return false;
+			}
+		}
+		return true;
+	}
+
+	_buildPolyPath2D(layer, path, closed) {
+		const parts = layer._parts;
+		if (!parts.length) { return; }
+
+		for (const ring of parts) {
+			for (let j = 0; j < ring.length; j++) {
+				const p = ring[j];
+				if (j === 0) {
+					path.moveTo(p.x, p.y);
+				} else {
+					path.lineTo(p.x, p.y);
+				}
+			}
+			if (closed) {
+				path.closePath();
+			}
+		}
+	}
+
+	_buildCirclePath2D(layer, path) {
+		if (layer._empty()) { return; }
+
+		const p = layer._point,
+		r = Math.max(Math.round(layer._pxRadius), 1);
+
+		path.arc(p.x, p.y, r, 0, Math.PI * 2, false);
+	}
+
+	_ensurePath2D(layer, kind, closed) {
+		if (layer._path2d) { return layer._path2d; }
+
+		const path = new Path2D();
+		if (kind === BATCH_KIND_POLY) {
+			this._buildPolyPath2D(layer, path, closed);
+		} else {
+			this._buildCirclePath2D(layer, path);
+		}
+
+		const parts = kind === BATCH_KIND_POLY ? layer._parts : null;
+		if (kind === BATCH_KIND_POLY && !parts.length) {
+			return null;
+		}
+		if (kind === BATCH_KIND_CIRCLE && layer._empty()) {
+			return null;
+		}
+
+		layer._path2d = path;
+		return path;
+	}
+
 	_appendPolyPath(layer, closed) {
 		const parts = layer._parts;
 		const ctx = this._ctx;
@@ -560,6 +667,14 @@ export class Canvas extends Renderer {
 		ctx = this._ctx;
 
 		if (!parts.length) { return; }
+
+		if (!this._disablePath2DCache && this._canUsePath2DCache(layer)) {
+			const path = this._ensurePath2D(layer, BATCH_KIND_POLY, closed);
+			if (path) {
+				this._fillStroke(ctx, layer, path);
+			}
+			return;
+		}
 
 		ctx.beginPath();
 		this._appendPolyPath(layer, closed);
@@ -585,6 +700,14 @@ export class Canvas extends Renderer {
 		r = Math.max(Math.round(layer._pxRadius), 1),
 		s = (Math.max(Math.round(layer._pxRadiusY), 1) || r) / r;
 
+		if (!this._disablePath2DCache && this._canUsePath2DCache(layer)) {
+			const path = this._ensurePath2D(layer, BATCH_KIND_CIRCLE);
+			if (path) {
+				this._fillStroke(ctx, layer, path);
+			}
+			return;
+		}
+
 		if (s !== 1) {
 			ctx.save();
 			ctx.scale(1, s);
@@ -600,13 +723,17 @@ export class Canvas extends Renderer {
 		this._fillStroke(ctx, layer);
 	}
 
-	_fillStroke(ctx, layer) {
+	_fillStroke(ctx, layer, path) {
 		const options = layer.options;
 
 		if (options.fill) {
 			ctx.globalAlpha = options.fillOpacity;
 			ctx.fillStyle = options.fillColor ?? options.color;
-			ctx.fill(options.fillRule || 'evenodd');
+			if (path) {
+				ctx.fill(path, options.fillRule || 'evenodd');
+			} else {
+				ctx.fill(options.fillRule || 'evenodd');
+			}
 		}
 
 		if (options.stroke && options.weight !== 0) {
@@ -617,7 +744,11 @@ export class Canvas extends Renderer {
 			ctx.strokeStyle = options.color;
 			ctx.lineCap = options.lineCap;
 			ctx.lineJoin = options.lineJoin;
-			ctx.stroke();
+			if (path) {
+				ctx.stroke(path);
+			} else {
+				ctx.stroke();
+			}
 		}
 	}
 
