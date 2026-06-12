@@ -298,6 +298,101 @@ describe('Canvas', () => {
 		});
 	});
 
+	describe('spatial index', () => {
+		function clickAtLatLng(latlng) {
+			const pt = map.latLngToContainerPoint(latlng);
+			UIEventSimulator.fireAt('click', pt.x, pt.y);
+		}
+
+		function hoverAtLatLng(latlng) {
+			const pt = map.latLngToContainerPoint(latlng);
+			UIEventSimulator.fireAt('pointermove', pt.x, pt.y);
+		}
+
+		it('hits the topmost overlapping layer on click', () => {
+			const bottom = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const top = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const bottomSpy = sinon.spy();
+			const topSpy = sinon.spy();
+			bottom.on('click', bottomSpy);
+			top.on('click', topSpy);
+
+			clickAtLatLng([0, 0]);
+			expect(topSpy.callCount).to.eql(1);
+			expect(bottomSpy.callCount).to.eql(0);
+		});
+
+		it('changes click target after bringToBack', () => {
+			const bottom = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const top = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const bottomSpy = sinon.spy();
+			const topSpy = sinon.spy();
+			bottom.on('click', bottomSpy);
+			top.on('click', topSpy);
+
+			top.bringToBack();
+			clickAtLatLng([0, 0]);
+			expect(bottomSpy.callCount).to.eql(1);
+			expect(topSpy.callCount).to.eql(0);
+		});
+
+		it('changes hover target after bringToFront', () => {
+			const bottom = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const top = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const bottomSpy = sinon.spy();
+			const topSpy = sinon.spy();
+			bottom.on('pointerover', bottomSpy);
+			top.on('pointerover', topSpy);
+
+			bottom.bringToFront();
+			hoverAtLatLng([0, 0]);
+			expect(bottomSpy.callCount).to.eql(1);
+			expect(topSpy.callCount).to.eql(0);
+		});
+
+		it('does not hit removed layers between pointer events', (done) => {
+			const layer = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const spy = sinon.spy();
+			layer.on('click', spy);
+
+			clickAtLatLng([0, 0]);
+			expect(spy.callCount).to.eql(1);
+
+			map.removeLayer(layer);
+			requestAnimationFrame(() => {
+				clickAtLatLng([0, 0]);
+				expect(spy.callCount).to.eql(1);
+				done();
+			});
+		});
+
+		it('hits newly added layers between pointer events', () => {
+			const layer = new CircleMarker([0, 0], {radius: 20});
+			const spy = sinon.spy();
+			layer.on('click', spy);
+
+			clickAtLatLng([0, 0]);
+			expect(spy.callCount).to.eql(0);
+
+			layer.addTo(map);
+			clickAtLatLng([0, 0]);
+			expect(spy.callCount).to.eql(1);
+		});
+
+		it('hit-tests correctly immediately after zoom', (done) => {
+			const layer = new CircleMarker([0, 0], {radius: 20}).addTo(map);
+			const spy = sinon.spy();
+			layer.on('click', spy);
+
+			map.setZoom(map.getZoom() + 1);
+			map.once('moveend', () => {
+				clickAtLatLng([0, 0]);
+				expect(spy.callCount).to.eql(1);
+				done();
+			});
+		});
+	});
+
 	describe('#_containsPoint', () => {
 		it('detects point inside polygon', () => {
 			const polygon = new Polygon([
