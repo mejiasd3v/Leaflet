@@ -149,6 +149,16 @@ export class Polyline extends Path {
 	_setLatLngs(latlngs) {
 		this._bounds = new LatLngBounds();
 		this._latlngs = this._convertLatLngs(latlngs);
+		this._invalidateProjCache();
+	}
+
+	_invalidateProjCache() {
+		this._projCacheValid = false;
+	}
+
+	redraw() {
+		this._invalidateProjCache();
+		return super.redraw();
 	}
 
 	_defaultShape() {
@@ -175,11 +185,40 @@ export class Polyline extends Path {
 	_project() {
 		const pxBounds = new Bounds();
 		this._rings = [];
-		this._projectLatlngs(this._latlngs, this._rings, pxBounds);
 
+		if (!this._projCacheValid) {
+			this._projCache = [];
+			this._buildProjCache(this._latlngs, this._projCache);
+			this._projCacheValid = true;
+		}
+
+		let cacheIdx = 0;
+		this._projectLatlngs(this._latlngs, this._rings, pxBounds, this._projCache, () => cacheIdx++);
 		if (this._bounds.isValid() && pxBounds.isValid()) {
 			this._rawPxBounds = pxBounds;
 			this._updateBounds();
+		}
+	}
+
+	// Build zoom-invariant projected coordinates (CRS projection only).
+	_buildProjCache(latlngs, cache) {
+		const flat = latlngs[0] instanceof LatLng;
+
+		if (flat) {
+			const projection = this._map.options.crs.projection;
+			const ringCache = new Float64Array(latlngs.length * 2);
+
+			for (let i = 0, len = latlngs.length; i < len; i++) {
+				const projected = projection.project(latlngs[i]);
+				ringCache[i * 2] = projected.x;
+				ringCache[i * 2 + 1] = projected.y;
+			}
+
+			cache.push(ringCache);
+		} else {
+			for (let i = 0, len = latlngs.length; i < len; i++) {
+				this._buildProjCache(latlngs[i], cache);
+			}
 		}
 	}
 
@@ -198,15 +237,33 @@ export class Polyline extends Path {
 	}
 
 	// recursively turns latlngs into a set of rings with projected coordinates
-	_projectLatlngs(latlngs, result, projectedBounds) {
+	_projectLatlngs(latlngs, result, projectedBounds, cache, nextCacheIdx) {
 		const flat = latlngs[0] instanceof LatLng;
 
 		if (flat) {
-			const ring = latlngs.map(latlng => this._map.latLngToLayerPoint(latlng));
-			ring.forEach(r => projectedBounds.extend(r));
+			const map = this._map;
+			const crs = map.options.crs;
+			const scale = crs.scale(map._zoom);
+			const transformation = crs.transformation;
+			const pixelOrigin = map.getPixelOrigin();
+			const ringCache = cache[nextCacheIdx()];
+			const ring = [];
+
+			for (let i = 0, len = latlngs.length; i < len; i++) {
+				const projectedPoint = transformation._transform(
+					new Point(ringCache[i * 2], ringCache[i * 2 + 1]),
+					scale
+				)._round();
+				const pt = projectedPoint._subtract(pixelOrigin);
+				ring.push(pt);
+				projectedBounds.extend(pt);
+			}
+
 			result.push(ring);
 		} else {
-			latlngs.forEach(latlng => this._projectLatlngs(latlng, result, projectedBounds));
+			for (let i = 0, len = latlngs.length; i < len; i++) {
+				this._projectLatlngs(latlngs[i], result, projectedBounds, cache, nextCacheIdx);
+			}
 		}
 	}
 
