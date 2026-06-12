@@ -1,6 +1,9 @@
-import {expect} from 'chai';
 import {Bounds, Canvas, CircleMarker, LeafletMap, Point} from 'leaflet';
+import {assertBenchSamples} from '../../BenchHelpers.js';
 import {createContainer} from '../../SpecHelper.js';
+
+// Report-only benchmarks: emit BENCH_RESULT for manual review. No
+// performance-comparison assertions in the default suite.
 
 const LAYER_COUNT = 10000;
 const LCG_SEED_S4 = 0xDEADBEEF;
@@ -141,11 +144,11 @@ describe('Canvas redraw benchmark', () => {
 				canvas._redrawBounds = mode === 'full' ? null : new Bounds(dirty90.min, dirty90.max);
 				canvas._redraw();
 			});
+			assertBenchSamples(times, `clip-investigation ${mode}`);
 			logBenchResult('clip-investigation', {mode}, times);
 		}
 
 		await cleanupBenchMap(map, container, canvas);
-		expect(true).to.be.true;
 	}, 300000);
 
 	it('isolates _redraw-only cost for small vs full dirty rects', async () => {
@@ -175,13 +178,13 @@ describe('Canvas redraw benchmark', () => {
 				canvas._redrawBounds = mode === 'redraw-full' ? null : new Bounds(smallDirty.min, smallDirty.max);
 				canvas._redraw();
 			});
+			assertBenchSamples(times, `clip-investigation-redraw-only ${mode}`);
 			logBenchResult('clip-investigation-redraw-only', {mode}, times);
 		}
 
 		stubRendererRedraw(canvas);
 		marker.remove();
 		await cleanupBenchMap(map, container, canvas);
-		expect(true).to.be.true;
 	}, 300000);
 
 	it('S4 moving marker among 10k static with and without dirty-rect promotion', async () => {
@@ -234,6 +237,7 @@ describe('Canvas redraw benchmark', () => {
 				renderer._redraw();
 			});
 
+			assertBenchSamples(times, `S4-moving-marker ${promotion}`);
 			logBenchResult('S4-moving-marker', {promotion}, times);
 		}
 
@@ -253,6 +257,7 @@ describe('Canvas redraw benchmark', () => {
 			const jumpLng = sw.lng + rngBreakdown() * (ne.lng - sw.lng);
 			moving.setLatLng([jumpLat, jumpLng]);
 		});
+		assertBenchSamples(setLatLngTimes, 'S4 setLatLng-only');
 		logBenchResult('S4-component-breakdown', {component: 'setLatLng-only'}, setLatLngTimes);
 
 		const rngRedraw = createLCG(LCG_SEED_S4);
@@ -277,11 +282,11 @@ describe('Canvas redraw benchmark', () => {
 			renderer._redraw();
 			redrawTimes[i] = performance.now() - start;
 		}
+		assertBenchSamples(redrawTimes, 'S4 redraw-after-setLatLng');
 		logBenchResult('S4-component-breakdown', {component: 'redraw-after-setLatLng'}, redrawTimes);
 
 		stubRendererRedraw(renderer);
 		moving.remove();
 		await cleanupBenchMap(map, container, renderer);
-		expect(true).to.be.true;
 	}, 300000);
 });

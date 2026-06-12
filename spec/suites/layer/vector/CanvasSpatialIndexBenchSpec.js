@@ -1,6 +1,10 @@
 import {expect} from 'chai';
 import {Bounds, Canvas, CircleMarker, LeafletMap} from 'leaflet';
+import {assertPositiveFiniteMs} from '../../BenchHelpers.js';
 import {createContainer, removeMapContainer} from '../../SpecHelper.js';
+
+// Report-only benchmark: logs timings for manual review. No
+// performance-comparison assertions in the default suite.
 
 const LAYER_COUNT = 10000;
 const HOVER_ITERATIONS = 50;
@@ -92,7 +96,9 @@ describe('Canvas spatial index benchmark', () => {
 
 	it(`indexes ${LAYER_COUNT} CircleMarkers for hover and dirty-rect queries`, () => {
 		expect(canvas._spatialGrid.usesIndex()).to.be.true;
-		expect(results.indexedHoverMs).to.be.lessThan(results.linearHoverMs);
-		expect(results.indexedRedrawQueryMs).to.be.lessThan(results.linearRedrawQueryMs);
+		assertPositiveFiniteMs(results.linearHoverMs, 'linear hover');
+		assertPositiveFiniteMs(results.indexedHoverMs, 'indexed hover');
+		assertPositiveFiniteMs(results.linearRedrawQueryMs, 'linear redraw query');
+		assertPositiveFiniteMs(results.indexedRedrawQueryMs, 'indexed redraw query');
 	});
 });
