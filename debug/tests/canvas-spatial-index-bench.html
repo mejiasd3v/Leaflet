@@ -1,0 +1,115 @@
+<!doctype html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>Leaflet debug page - Canvas Spatial Index Benchmark</title>
+		<meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=0" />
+		<link rel="stylesheet" href="../../dist/leaflet.css" />
+		<link rel="stylesheet" href="../css/screen.css" />
+		<style>
+			#results {
+				position: absolute;
+				top: 12px;
+				right: 12px;
+				z-index: 1000;
+				background: rgba(255, 255, 255, 0.92);
+				padding: 12px 16px;
+				font: 13px/1.5 monospace;
+				max-width: 420px;
+				white-space: pre-wrap;
+			}
+		</style>
+		<script type="importmap">
+			{
+				"imports": {
+					"leaflet": "../../dist/leaflet-src.js"
+				}
+			}
+		</script>
+	</head>
+	<body>
+		<div id="map"></div>
+		<pre id="results">Running benchmark…</pre>
+		<script type="module">
+			import {Bounds, Canvas, CircleMarker, LeafletMap} from 'leaflet';
+
+			const LAYER_COUNT = 10000;
+			const HOVER_ITERATIONS = 50;
+			const REDRAW_QUERY_ITERATIONS = 100;
+
+			function linearFindInteractiveLayerAt(canvas, point) {
+				let topmost;
+				for (let order = canvas._drawFirst; order; order = order.next) {
+					const layer = order.layer;
+					if (layer.options.interactive && layer._containsPoint(point)) {
+						topmost = layer;
+					}
+				}
+				return topmost;
+			}
+
+			function linearQueryDrawCandidates(canvas, bounds) {
+				const candidates = [];
+				for (let order = canvas._drawFirst; order; order = order.next) {
+					const layer = order.layer;
+					if (!bounds || (layer._pxBounds && layer._pxBounds.intersects(bounds))) {
+						candidates.push(layer);
+					}
+				}
+				return candidates;
+			}
+
+			function meanTime(fn, iterations) {
+				const start = performance.now();
+				for (let i = 0; i < iterations; i++) {
+					fn();
+				}
+				return (performance.now() - start) / iterations;
+			}
+
+			const canvas = new Canvas();
+			const map = new LeafletMap('map', {renderer: canvas}).setView([0, 0], 6);
+			const markers = [];
+
+			for (let i = 0; i < LAYER_COUNT; i++) {
+				markers.push(new CircleMarker([
+					(Math.random() - 0.5) * 20,
+					(Math.random() - 0.5) * 20
+				], {radius: 4}).addTo(map));
+			}
+
+			const queryPoint = map.latLngToLayerPoint([0, 0]);
+			const target = markers[0];
+			const padding = 4;
+			const dirtyBounds = new Bounds(
+				target._pxBounds.min.subtract([padding, padding]),
+				target._pxBounds.max.add([padding, padding])
+			);
+
+			const results = {
+				layerCount: LAYER_COUNT,
+				hoverIterations: HOVER_ITERATIONS,
+				redrawQueryIterations: REDRAW_QUERY_ITERATIONS,
+				linearHoverMs: meanTime(
+					() => linearFindInteractiveLayerAt(canvas, queryPoint),
+					HOVER_ITERATIONS
+				),
+				indexedHoverMs: meanTime(() => {
+					canvas._pointerHoverThrottled = false;
+					canvas._handlePointerHover({type: 'pointermove'}, queryPoint);
+				}, HOVER_ITERATIONS),
+				linearRedrawQueryMs: meanTime(
+					() => linearQueryDrawCandidates(canvas, dirtyBounds),
+					REDRAW_QUERY_ITERATIONS
+				),
+				indexedRedrawQueryMs: meanTime(
+					() => canvas._spatialGrid.queryBounds(dirtyBounds),
+					REDRAW_QUERY_ITERATIONS
+				)
+			};
+
+			document.getElementById('results').textContent =
+				`Canvas spatial index benchmark\n\n${JSON.stringify(results, null, 2)}`;
+		</script>
+	</body>
+</html>
