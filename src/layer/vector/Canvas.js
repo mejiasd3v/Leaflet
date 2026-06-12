@@ -340,31 +340,41 @@ export class Canvas extends Renderer {
 
 			const ctx = this._ctx;
 			if (!this._disablePath2DCache && this._batchCanUsePath2D(batchLayers)) {
-				const batchPath = new Path2D();
 				let allCached = true;
+				let allWarm = true;
 				for (let i = 0; i < batchLayers.length; i++) {
 					if (!batchLayers[i]._path2d) {
 						allCached = false;
-						break;
+					}
+					if (!batchLayers[i]._path2dWarm) {
+						allWarm = false;
 					}
 				}
 				if (allCached) {
+					const batchPath = new Path2D();
 					for (let i = 0; i < batchLayers.length; i++) {
 						batchPath.addPath(batchLayers[i]._path2d);
 					}
-				} else {
+					this._fillStroke(ctx, batchLayers[0], batchPath);
+				} else if (allWarm) {
+					const batchPath = new Path2D();
 					for (let i = 0; i < batchLayers.length; i++) {
 						const layer = batchLayers[i];
-						const kind = batchKinds[i];
-						if (kind === BATCH_KIND_POLY) {
-							this._buildPolyPath2D(layer, batchPath, false);
-						} else {
-							this._buildCirclePath2D(layer, batchPath);
-						}
-						this._ensurePath2D(layer, kind, kind === BATCH_KIND_POLY ? false : undefined);
+						const path = new Path2D();
+						this._buildPolyPath2D(layer, path, false);
+						layer._path2d = path;
+						batchPath.addPath(path);
 					}
+					this._fillStroke(ctx, batchLayers[0], batchPath);
+				} else {
+					ctx.beginPath();
+					for (let i = 0; i < batchLayers.length; i++) {
+						const layer = batchLayers[i];
+						layer._path2dWarm = true;
+						this._appendPolyPath(layer, false);
+					}
+					this._fillStroke(ctx, batchLayers[0]);
 				}
-				this._fillStroke(ctx, batchLayers[0], batchPath);
 			} else {
 				ctx.beginPath();
 				for (let i = 0; i < batchLayers.length; i++) {
@@ -571,18 +581,11 @@ export class Canvas extends Renderer {
 
 	_invalidatePath2D(layer) {
 		delete layer._path2d;
+		layer._path2dWarm = false;
 	}
 
 	_canUsePath2DCache(layer) {
-		const updatePath = layer._updatePath;
-		if (updatePath !== STOCK_POLYLINE_UPDATE_PATH &&
-			updatePath !== STOCK_CIRCLE_MARKER_UPDATE_PATH) {
-			return false;
-		}
-		if (updatePath === STOCK_CIRCLE_MARKER_UPDATE_PATH && this._isEllipseCircle(layer)) {
-			return false;
-		}
-		return true;
+		return layer._updatePath === STOCK_POLYLINE_UPDATE_PATH;
 	}
 
 	_batchCanUsePath2D(batchLayers) {
@@ -613,37 +616,6 @@ export class Canvas extends Renderer {
 		}
 	}
 
-	_buildCirclePath2D(layer, path) {
-		if (layer._empty()) { return; }
-
-		const p = layer._point,
-		r = Math.max(Math.round(layer._pxRadius), 1);
-
-		path.arc(p.x, p.y, r, 0, Math.PI * 2, false);
-	}
-
-	_ensurePath2D(layer, kind, closed) {
-		if (layer._path2d) { return layer._path2d; }
-
-		const path = new Path2D();
-		if (kind === BATCH_KIND_POLY) {
-			this._buildPolyPath2D(layer, path, closed);
-		} else {
-			this._buildCirclePath2D(layer, path);
-		}
-
-		const parts = kind === BATCH_KIND_POLY ? layer._parts : null;
-		if (kind === BATCH_KIND_POLY && !parts.length) {
-			return null;
-		}
-		if (kind === BATCH_KIND_CIRCLE && layer._empty()) {
-			return null;
-		}
-
-		layer._path2d = path;
-		return path;
-	}
-
 	_appendPolyPath(layer, closed) {
 		const parts = layer._parts;
 		const ctx = this._ctx;
@@ -669,10 +641,23 @@ export class Canvas extends Renderer {
 		if (!parts.length) { return; }
 
 		if (!this._disablePath2DCache && this._canUsePath2DCache(layer)) {
-			const path = this._ensurePath2D(layer, BATCH_KIND_POLY, closed);
-			if (path) {
-				this._fillStroke(ctx, layer, path);
+			if (layer._path2d) {
+				this._fillStroke(ctx, layer, layer._path2d);
+				return;
 			}
+
+			if (!layer._path2dWarm) {
+				ctx.beginPath();
+				this._appendPolyPath(layer, closed);
+				this._fillStroke(ctx, layer);
+				layer._path2dWarm = true;
+				return;
+			}
+
+			const path = new Path2D();
+			this._buildPolyPath2D(layer, path, closed);
+			layer._path2d = path;
+			this._fillStroke(ctx, layer, path);
 			return;
 		}
 
@@ -699,14 +684,6 @@ export class Canvas extends Renderer {
 		ctx = this._ctx,
 		r = Math.max(Math.round(layer._pxRadius), 1),
 		s = (Math.max(Math.round(layer._pxRadiusY), 1) || r) / r;
-
-		if (!this._disablePath2DCache && this._canUsePath2DCache(layer)) {
-			const path = this._ensurePath2D(layer, BATCH_KIND_CIRCLE);
-			if (path) {
-				this._fillStroke(ctx, layer, path);
-			}
-			return;
-		}
 
 		if (s !== 1) {
 			ctx.save();
