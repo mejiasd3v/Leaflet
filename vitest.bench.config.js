@@ -9,5 +9,6 @@ export default defineConfig({
 	},
 	test: {
 		include: ['benchmarks/**/*.bench.js'],
+		environment: 'happy-dom',
 	},
 });
