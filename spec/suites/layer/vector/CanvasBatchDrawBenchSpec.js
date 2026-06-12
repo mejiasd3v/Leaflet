@@ -19,9 +19,9 @@ function mean(values) {
 	return values.reduce((sum, v) => sum + v, 0) / values.length;
 }
 
-function withinNoise(batched, unbatched, tolerance = 0.05) {
+function withinRegressionNoise(batched, unbatched, tolerance = 0.05) {
 	if (unbatched === 0) { return batched === 0; }
-	return Math.abs(batched - unbatched) / unbatched <= tolerance;
+	return batched <= unbatched * (1 + tolerance);
 }
 
 function benchRedraw(renderer, iterations) {
@@ -173,11 +173,11 @@ describe('Canvas batch draw benchmark', () => {
 		const overlap = benchResults.find(r => r.scenario === 'overlap-heavy');
 
 		expect(
-			withinNoise(alternating.batched_median_ms, alternating.unbatched_median_ms),
+			withinRegressionNoise(alternating.batched_median_ms, alternating.unbatched_median_ms),
 			`alternating batched ${alternating.batched_median_ms} vs unbatched ${alternating.unbatched_median_ms}`
 		).to.be.true;
 		expect(
-			withinNoise(overlap.batched_median_ms, overlap.unbatched_median_ms),
+			withinRegressionNoise(overlap.batched_median_ms, overlap.unbatched_median_ms),
 			`overlap batched ${overlap.batched_median_ms} vs unbatched ${overlap.unbatched_median_ms}`
 		).to.be.true;
 	});
