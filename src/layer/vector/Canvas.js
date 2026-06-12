@@ -1,10 +1,15 @@
 import {Renderer} from './Renderer.js';
 import {CanvasSpatialGrid} from './CanvasSpatialGrid.js';
+import {Polyline} from './Polyline.js';
+import {CircleMarker} from './CircleMarker.js';
 import * as DomEvent from '../../dom/DomEvent.js';
 import * as Util from '../../core/Util.js';
 import {Bounds} from '../../geometry/Bounds.js';
 
 const DASH_SEPARATOR_RE = /[, ]+/;
+const BATCH_MAX_SIZE = 512;
+const STOCK_POLYLINE_UPDATE_PATH = Polyline.prototype._updatePath;
+const STOCK_CIRCLE_MARKER_UPDATE_PATH = CircleMarker.prototype._updatePath;
 
 /*
  * @class Canvas
@@ -155,6 +160,7 @@ export class Canvas extends Renderer {
 
 	_initPath(layer) {
 		this._updateDashArray(layer);
+		this._invalidateBatchStyleKey(layer);
 		this._layers[Util.stamp(layer)] = layer;
 
 		const order = layer._order = {
@@ -211,6 +217,7 @@ export class Canvas extends Renderer {
 
 	_updateStyle(layer) {
 		this._updateDashArray(layer);
+		this._invalidateBatchStyleKey(layer);
 		this._requestRedraw(layer);
 	}
 
@@ -280,24 +287,213 @@ export class Canvas extends Renderer {
 
 		this._drawing = true;
 
+		let batch = null;
+		let pending = null;
+
+		const extendBatchUnionBounds = (target, pxBounds) => {
+			target.unionBounds = target.unionBounds ?
+				new Bounds(target.unionBounds).extend(pxBounds) :
+				new Bounds(pxBounds.min, pxBounds.max);
+		};
+
+		const flushBatch = () => {
+			if (!batch?.layers.length) { return; }
+
+			const ctx = this._ctx;
+			ctx.beginPath();
+			for (const item of batch.layers) {
+				if (item.kind === 'poly') {
+					this._appendPolyPath(item.layer, item.closed);
+				} else {
+					this._appendCirclePath(item.layer);
+				}
+			}
+			this._fillStroke(ctx, batch.layers[0].layer);
+			batch = null;
+		};
+
+		const drawPending = () => {
+			if (!pending) { return; }
+			pending.item.layer._updatePath();
+			pending = null;
+		};
+
+		const startBatch = (first, second, styleKey) => {
+			batch = {
+				styleKey,
+				layers: [first, second],
+				unionBounds: null
+			};
+			for (const item of batch.layers) {
+				const pxBounds = item.layer._pxBounds;
+				if (pxBounds) {
+					extendBatchUnionBounds(batch, pxBounds);
+				}
+			}
+		};
+
+		const drawLayer = (layer) => {
+			if (bounds && (!layer._pxBounds || !layer._pxBounds.intersects(bounds))) {
+				return;
+			}
+
+			if (this._disablePathBatching) {
+				layer._updatePath();
+				return;
+			}
+
+			const item = this._getLayerBatchItem(layer);
+			if (!item) {
+				flushBatch();
+				drawPending();
+				layer._updatePath();
+				return;
+			}
+
+			const styleKey = this._getBatchStyleKey(layer);
+
+			if (batch) {
+				if (!this._batchStyleKeysEqual(batch.styleKey, styleKey) ||
+					batch.layers.length >= BATCH_MAX_SIZE ||
+					this._batchBoundsOverlap(batch, layer)) {
+					flushBatch();
+				} else {
+					batch.layers.push(item);
+					if (layer._pxBounds) {
+						extendBatchUnionBounds(batch, layer._pxBounds);
+					}
+					return;
+				}
+			}
+
+			if (pending) {
+				if (this._batchStyleKeysEqual(pending.styleKey, styleKey) &&
+					!this._pxBoundsOverlap(pending.item.layer._pxBounds, layer._pxBounds)) {
+					startBatch(pending.item, item, styleKey);
+					pending = null;
+					return;
+				}
+				drawPending();
+			}
+
+			pending = {item, styleKey};
+		};
+
 		if (candidates) {
 			for (const layer of candidates) {
-				if (!bounds || (layer._pxBounds && layer._pxBounds.intersects(bounds))) {
-					layer._updatePath();
-				}
+				drawLayer(layer);
 			}
 		} else {
 			for (let order = this._drawFirst; order; order = order.next) {
-				const layer = order.layer;
-				if (!bounds || (layer._pxBounds && layer._pxBounds.intersects(bounds))) {
-					layer._updatePath();
-				}
+				drawLayer(order.layer);
 			}
 		}
+
+		flushBatch();
+		drawPending();
 
 		this._drawing = false;
 
 		this._ctx.restore();  // Restore state before clipping.
+	}
+
+	_invalidateBatchStyleKey(layer) {
+		delete layer._batchStyleKey;
+	}
+
+	_getBatchStyleKey(layer) {
+		if (layer._batchStyleKey) { return layer._batchStyleKey; }
+
+		const options = layer.options;
+		const dash = options._dashArray;
+		layer._batchStyleKey = [
+			options.stroke,
+			options.color,
+			options.weight,
+			options.opacity,
+			options.lineCap,
+			options.lineJoin,
+			dash,
+			options.dashOffset,
+			options.fill,
+			options.fillColor,
+			options.fillOpacity,
+			options.fillRule || 'evenodd'
+		];
+		return layer._batchStyleKey;
+	}
+
+	_batchStyleKeysEqual(a, b) {
+		if (a.length !== b.length) { return false; }
+		for (let i = 0; i < a.length; i++) {
+			const av = a[i];
+			const bv = b[i];
+			if (av === bv) { continue; }
+			if (Array.isArray(av) && Array.isArray(bv)) {
+				if (av.length !== bv.length) { return false; }
+				for (let j = 0; j < av.length; j++) {
+					if (av[j] !== bv[j]) { return false; }
+				}
+				continue;
+			}
+			return false;
+		}
+		return true;
+	}
+
+	_getLayerBatchItem(layer) {
+		const updatePath = layer._updatePath;
+		if (updatePath === STOCK_POLYLINE_UPDATE_PATH) {
+			return {layer, kind: 'poly', closed: false};
+		}
+		if (updatePath === STOCK_CIRCLE_MARKER_UPDATE_PATH && !this._isEllipseCircle(layer)) {
+			return {layer, kind: 'circle'};
+		}
+		return null;
+	}
+
+	_isEllipseCircle(layer) {
+		const r = Math.max(Math.round(layer._pxRadius), 1);
+		const ry = layer._pxRadiusY;
+		if (ry == null) { return false; }
+		const s = (Math.max(Math.round(ry), 1) || r) / r;
+		return s !== 1;
+	}
+
+	_pxBoundsOverlap(a, b) {
+		if (!a || !b) { return false; }
+		return a.intersects(b);
+	}
+
+	_batchBoundsOverlap(batch, layer) {
+		const pxBounds = layer._pxBounds;
+		if (!pxBounds || !batch.layers.length) { return false; }
+
+		if (batch.unionBounds && pxBounds.intersects(batch.unionBounds)) {
+			for (const item of batch.layers) {
+				const memberBounds = item.layer._pxBounds;
+				if (memberBounds && pxBounds.intersects(memberBounds)) {
+					return true;
+				}
+			}
+		}
+		return false;
+	}
+
+	_appendPolyPath(layer, closed) {
+		const parts = layer._parts;
+		const ctx = this._ctx;
+
+		if (!parts.length) { return; }
+
+		parts.forEach((p0) => {
+			p0.forEach((p, j) => {
+				ctx[j ? 'lineTo' : 'moveTo'](p.x, p.y);
+			});
+			if (closed) {
+				ctx.closePath();
+			}
+		});
 	}
 
 	_updatePoly(layer, closed) {
@@ -309,19 +505,18 @@ export class Canvas extends Renderer {
 		if (!parts.length) { return; }
 
 		ctx.beginPath();
-
-		parts.forEach((p0) => {
-			p0.forEach((p, j) => {
-				ctx[j ? 'lineTo' : 'moveTo'](p.x, p.y);
-			});
-			if (closed) {
-				ctx.closePath();
-			}
-		});
-
+		this._appendPolyPath(layer, closed);
 		this._fillStroke(ctx, layer);
+	}
 
-		// TODO optimization: 1 fill/stroke for all features with equal style instead of 1 for each feature
+	_appendCirclePath(layer) {
+		if (layer._empty()) { return; }
+
+		const p = layer._point,
+		ctx = this._ctx,
+		r = Math.max(Math.round(layer._pxRadius), 1);
+
+		ctx.arc(p.x, p.y, r, 0, Math.PI * 2, false);
 	}
 
 	_updateCircle(layer) {
