@@ -5,6 +5,7 @@ import {CircleMarker} from './CircleMarker.js';
 import * as DomEvent from '../../dom/DomEvent.js';
 import * as Util from '../../core/Util.js';
 import {Bounds} from '../../geometry/Bounds.js';
+import {Point} from '../../geometry/Point.js';
 
 const DASH_SEPARATOR_RE = /[, ]+/;
 const BATCH_MAX_SIZE = 512;
@@ -13,9 +14,9 @@ const BATCH_KIND_POLY = 1;
 const BATCH_KIND_CIRCLE = 2;
 const REDRAW_PROMOTE_THRESHOLD = 0.25;
 const REDRAW_PROMOTE_CANDIDATE_THRESHOLD = 1500;
+const PAN_STRIP_PADDING = 32;
 const STOCK_POLYLINE_UPDATE_PATH = Polyline.prototype._updatePath;
 const STOCK_CIRCLE_MARKER_UPDATE_PATH = CircleMarker.prototype._updatePath;
-
 /*
  * @class Canvas
  * @inherits Renderer
@@ -106,10 +107,16 @@ export class Canvas extends Renderer {
 	_resizeContainer() {
 		const size = super._resizeContainer();
 		const m = this._ctxScale = window.devicePixelRatio;
+		const w = Math.round(m * size.x);
+		const h = Math.round(m * size.y);
 
-		// set canvas size (also clearing it); use double size on retina
-		this._container.width = m * size.x;
-		this._container.height = m * size.y;
+		// Assigning width/height clears the backing store; skip when unchanged.
+		if (this._container.width !== w || this._container.height !== h) {
+			this._container.width = w;
+			this._container.height = h;
+		}
+
+		return size;
 	}
 
 	_onZoomEnd() {
@@ -125,6 +132,22 @@ export class Canvas extends Renderer {
 	_updatePaths() {
 		if (this._postponeUpdatePaths) { return; }
 
+		const panBlit = this._getPanBlitState();
+		if (panBlit) {
+			const stripUnion = this._unionPanStrips(panBlit.strips);
+			const expandedStrip = stripUnion ? this._expandPanStrip(stripUnion) : null;
+			this._blitPan(panBlit.delta);
+			if (expandedStrip) {
+				const expandedStrips = [expandedStrip];
+				for (const layer of Object.values(this._layers)) {
+					layer._update();
+				}
+				this._redrawPanStrips(expandedStrips);
+			}
+			this._saveSettleState();
+			return;
+		}
+
 		this._redrawBounds = null;
 		for (const layer of Object.values(this._layers)) {
 			layer._update();
@@ -136,6 +159,7 @@ export class Canvas extends Renderer {
 		}
 
 		this._redraw();
+		this._saveSettleState();
 	}
 
 	_update() {
@@ -267,8 +291,178 @@ export class Canvas extends Renderer {
 		this._redrawBounds = null;
 	}
 
+	_redrawPanStrips(strips) {
+		this._panStripRedraw = true;
+		const batchingDisabled = this._disablePathBatching;
+		this._disablePathBatching = true;
+		try {
+			for (const strip of strips) {
+				this._redrawBounds = strip;
+				this._redrawBounds.min._floor();
+				this._redrawBounds.max._ceil();
+				this._maybePromoteRedrawBounds();
+				this._clear();
+				this._draw();
+			}
+		} finally {
+			this._disablePathBatching = batchingDisabled;
+			this._panStripRedraw = false;
+			this._redrawBounds = null;
+		}
+	}
+
+	_saveSettleState() {
+		if (!this._bounds || !this._container) { return; }
+
+		this._lastSettleBounds = new Bounds(this._bounds.min, this._bounds.max);
+		this._lastSettleZoom = this._zoom;
+		this._lastSettleCtxScale = this._ctxScale;
+		this._lastContainerWidth = this._container.width;
+		this._lastContainerHeight = this._container.height;
+	}
+
+	_getPanBlitState() {
+		if (this._disablePanBlit || !this._lastSettleBounds || !this._bounds || !this._map) {
+			return null;
+		}
+
+		if (this._map._animatingZoom || this._zoom !== this._lastSettleZoom) {
+			return null;
+		}
+
+		if (this._ctxScale !== this._lastSettleCtxScale ||
+			this._container.width !== this._lastContainerWidth ||
+			this._container.height !== this._lastContainerHeight) {
+			return null;
+		}
+
+		const oldBounds = this._lastSettleBounds;
+		const newBounds = this._bounds;
+		const delta = newBounds.min.subtract(oldBounds.min);
+
+		if (delta.x === 0 && delta.y === 0) {
+			return null;
+		}
+
+		const s = this._ctxScale;
+		const deviceDx = delta.x * s;
+		const deviceDy = delta.y * s;
+
+		if (!Number.isInteger(deviceDx) || !Number.isInteger(deviceDy)) {
+			return null;
+		}
+
+		const canvasW = this._container.width;
+		const canvasH = this._container.height;
+
+		if (Math.abs(deviceDx) >= canvasW || Math.abs(deviceDy) >= canvasH) {
+			return null;
+		}
+
+		const strips = this._computePanStrips(newBounds, delta);
+		if (!strips.length) {
+			return null;
+		}
+
+		return {delta, strips, oldBounds, newBounds};
+	}
+
+	_computePanStrips(newBounds, delta) {
+		const strips = [];
+		const d = delta;
+
+		if (d.x > 0) {
+			strips.push(new Bounds(
+				new Point(newBounds.max.x - d.x, newBounds.min.y),
+				new Point(newBounds.max.x, newBounds.max.y - (d.y > 0 ? d.y : 0))
+			));
+		} else if (d.x < 0) {
+			strips.push(new Bounds(
+				new Point(newBounds.min.x, newBounds.min.y),
+				new Point(newBounds.min.x - d.x, newBounds.max.y - (d.y > 0 ? d.y : 0))
+			));
+		}
+
+		if (d.y > 0) {
+			strips.push(new Bounds(
+				new Point(newBounds.min.x, newBounds.max.y - d.y),
+				new Point(newBounds.max.x - (d.x > 0 ? d.x : 0), newBounds.max.y)
+			));
+		} else if (d.y < 0) {
+			strips.push(new Bounds(
+				new Point(newBounds.min.x + (d.x < 0 ? -d.x : 0), newBounds.min.y),
+				new Point(newBounds.max.x, newBounds.min.y - d.y)
+			));
+		}
+
+		return strips;
+	}
+
+	_blitPan(delta) {
+		const s = this._ctxScale;
+		const ox = -delta.x * s;
+		const oy = -delta.y * s;
+		const w = this._container.width;
+		const h = this._container.height;
+
+		let buffer = this._panBlitBuffer;
+		if (!buffer || buffer.width !== w || buffer.height !== h) {
+			buffer = this._panBlitBuffer = document.createElement('canvas');
+			buffer.width = w;
+			buffer.height = h;
+		}
+
+		buffer.getContext('2d').drawImage(this._container, 0, 0, w, h);
+
+		this._ctx.save();
+		this._ctx.setTransform(1, 0, 0, 1, 0, 0);
+		this._ctx.clearRect(0, 0, w, h);
+		this._ctx.drawImage(buffer, 0, 0, w, h, ox, oy, w, h);
+		this._ctx.restore();
+	}
+
+	_unionPanStrips(strips) {
+		let union = null;
+		for (const strip of strips) {
+			union = union ?
+				new Bounds(union).extend(strip) :
+				new Bounds(strip.min, strip.max);
+		}
+		return union;
+	}
+
+	_expandPanStrip(strip) {
+		const view = this._bounds;
+		const expanded = new Bounds(
+			new Point(
+				Math.max(strip.min.x - PAN_STRIP_PADDING, view.min.x),
+				Math.max(strip.min.y - PAN_STRIP_PADDING, view.min.y)
+			),
+			new Point(
+				Math.min(strip.max.x + PAN_STRIP_PADDING, view.max.x),
+				Math.min(strip.max.y + PAN_STRIP_PADDING, view.max.y)
+			)
+		);
+
+		// Include full bounds of every layer touching the strip so translucent
+		// stacks composite with the same underpaint a full redraw would use.
+		for (const layer of Object.values(this._layers)) {
+			if (layer._pxBounds?.intersects(strip)) {
+				expanded.extend(layer._pxBounds);
+			}
+		}
+
+		expanded.min.x = Math.max(expanded.min.x, view.min.x);
+		expanded.min.y = Math.max(expanded.min.y, view.min.y);
+		expanded.max.x = Math.min(expanded.max.x, view.max.x);
+		expanded.max.y = Math.min(expanded.max.y, view.max.y);
+
+		return expanded;
+	}
+
 	_maybePromoteRedrawBounds() {
-		if (this._disableDirtyRectPromotion || !this._redrawBounds || !this._bounds) {
+		if (this._disableDirtyRectPromotion || this._panStripRedraw ||
+			!this._redrawBounds || !this._bounds) {
 			return;
 		}
 
@@ -303,7 +497,9 @@ export class Canvas extends Renderer {
 
 	_draw() {
 		const bounds = this._redrawBounds;
-		const candidates = this._spatialGrid?.queryBounds(bounds);
+		const candidates = this._panStripRedraw ?
+			null :
+			this._spatialGrid?.queryBounds(bounds);
 		this._ctx.save();
 		if (bounds) {
 			const size = bounds.getSize();
