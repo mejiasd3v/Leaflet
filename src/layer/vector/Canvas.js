@@ -1,4 +1,5 @@
 import {Renderer} from './Renderer.js';
+import {CanvasSpatialGrid} from './CanvasSpatialGrid.js';
 import * as DomEvent from '../../dom/DomEvent.js';
 import * as Util from '../../core/Util.js';
 import {Bounds} from '../../geometry/Bounds.js';
@@ -60,6 +61,8 @@ export class Canvas extends Renderer {
 	onAdd(map) {
 		super.onAdd(map);
 
+		this._spatialGrid ??= new CanvasSpatialGrid();
+
 		// Redraw vectors since canvas is cleared upon removal,
 		// in case of removing the renderer itself from the map.
 		this._draw();
@@ -98,6 +101,11 @@ export class Canvas extends Renderer {
 		this._container.height = m * size.y;
 	}
 
+	_onZoomEnd() {
+		super._onZoomEnd();
+		this._spatialIndexDirty = true;
+	}
+
 	_updatePaths() {
 		if (this._postponeUpdatePaths) { return; }
 
@@ -105,6 +113,12 @@ export class Canvas extends Renderer {
 		for (const layer of Object.values(this._layers)) {
 			layer._update();
 		}
+
+		if (this._spatialIndexDirty) {
+			this._spatialGrid?.rebuild(this._layers);
+			this._spatialIndexDirty = false;
+		}
+
 		this._redraw();
 	}
 
@@ -142,12 +156,14 @@ export class Canvas extends Renderer {
 			prev: this._drawLast,
 			next: null
 		};
+		this._spatialGrid?.assignSeq(order);
 		if (this._drawLast) { this._drawLast.next = order; }
 		this._drawLast = order;
 		this._drawFirst ??= this._drawLast;
 	}
 
 	_addPath(layer) {
+		this._spatialGrid?.add(layer);
 		this._requestRedraw(layer);
 	}
 
@@ -171,6 +187,7 @@ export class Canvas extends Renderer {
 
 		delete this._layers[Util.stamp(layer)];
 
+		this._spatialGrid?.remove(layer);
 		this._requestRedraw(layer);
 	}
 
@@ -180,6 +197,7 @@ export class Canvas extends Renderer {
 		this._extendRedrawBounds(layer);
 		layer._project();
 		layer._update();
+		this._spatialGrid?.reindex(layer);
 		// The redraw will extend the redraw bounds
 		// with the new pixel bounds.
 		this._requestRedraw(layer);
@@ -244,8 +262,8 @@ export class Canvas extends Renderer {
 	}
 
 	_draw() {
-		let layer;
 		const bounds = this._redrawBounds;
+		const candidates = this._spatialGrid?.queryBounds(bounds);
 		this._ctx.save();
 		if (bounds) {
 			const size = bounds.getSize();
@@ -256,10 +274,18 @@ export class Canvas extends Renderer {
 
 		this._drawing = true;
 
-		for (let order = this._drawFirst; order; order = order.next) {
-			layer = order.layer;
-			if (!bounds || (layer._pxBounds && layer._pxBounds.intersects(bounds))) {
-				layer._updatePath();
+		if (candidates) {
+			for (const layer of candidates) {
+				if (!bounds || (layer._pxBounds && layer._pxBounds.intersects(bounds))) {
+					layer._updatePath();
+				}
+			}
+		} else {
+			for (let order = this._drawFirst; order; order = order.next) {
+				const layer = order.layer;
+				if (!bounds || (layer._pxBounds && layer._pxBounds.intersects(bounds))) {
+					layer._updatePath();
+				}
 			}
 		}
 
@@ -342,16 +368,8 @@ export class Canvas extends Renderer {
 
 	_onClick(e) {
 		const point = this._map.pointerEventToLayerPoint(e);
-		let layer, clickedLayer;
-
-		for (let order = this._drawFirst; order; order = order.next) {
-			layer = order.layer;
-			if (layer.options.interactive && layer._containsPoint(point)) {
-				if (!(e.type === 'click' || e.type === 'preclick') || !this._map._draggableMoved(layer)) {
-					clickedLayer = layer;
-				}
-			}
-		}
+		const clickedLayer = this._findInteractiveLayerAt(point, layer => !(e.type === 'click' || e.type === 'preclick') || !this._map._draggableMoved(layer)
+		);
 		this._fireEvent(clickedLayer ? [clickedLayer] : false, e);
 	}
 
@@ -379,14 +397,7 @@ export class Canvas extends Renderer {
 			return;
 		}
 
-		let layer, candidateHoveredLayer;
-
-		for (let order = this._drawFirst; order; order = order.next) {
-			layer = order.layer;
-			if (layer.options.interactive && layer._containsPoint(point)) {
-				candidateHoveredLayer = layer;
-			}
-		}
+		const candidateHoveredLayer = this._findInteractiveLayerAt(point);
 
 		if (candidateHoveredLayer !== this._hoveredLayer) {
 			this._handlePointerOut(e);
@@ -408,6 +419,32 @@ export class Canvas extends Renderer {
 
 	_fireEvent(layers, e, type) {
 		this._map._fireDOMEvent(e, type || e.type, layers);
+	}
+
+	_findInteractiveLayerAt(point, accept) {
+		const candidates = this._spatialGrid?.queryPoint(point);
+		let topmost;
+
+		if (candidates) {
+			for (const layer of candidates) {
+				if (layer.options.interactive && layer._containsPoint(point)) {
+					if (!accept || accept(layer)) {
+						topmost = layer;
+					}
+				}
+			}
+		} else {
+			for (let order = this._drawFirst; order; order = order.next) {
+				const layer = order.layer;
+				if (layer.options.interactive && layer._containsPoint(point)) {
+					if (!accept || accept(layer)) {
+						topmost = layer;
+					}
+				}
+			}
+		}
+
+		return topmost;
 	}
 
 	_bringToFront(layer) {
@@ -438,6 +475,7 @@ export class Canvas extends Renderer {
 		order.next = null;
 		this._drawLast = order;
 
+		order.seq = this._spatialGrid?.seqToFront() ?? order.seq;
 		this._requestRedraw(layer);
 	}
 
@@ -469,6 +507,7 @@ export class Canvas extends Renderer {
 		this._drawFirst.prev = order;
 		this._drawFirst = order;
 
+		order.seq = this._spatialGrid?.seqToBack() ?? order.seq;
 		this._requestRedraw(layer);
 	}
 }
