@@ -154,6 +154,7 @@ export class Polyline extends Path {
 
 	_invalidateProjCache() {
 		this._projCacheValid = false;
+		this._projCacheProjection = null;
 	}
 
 	redraw() {
@@ -184,20 +185,63 @@ export class Polyline extends Path {
 
 	_project() {
 		const pxBounds = new Bounds();
-		this._rings = [];
+		const projection = this._map.options.crs.projection;
 
-		if (!this._projCacheValid) {
+		if (!this._projCacheValid || this._projCacheProjection !== projection) {
 			this._projCache = [];
 			this._buildProjCache(this._latlngs, this._projCache);
+			this._projCacheProjection = projection;
 			this._projCacheValid = true;
 		}
 
+		const reuseRings = this._ringsStructureMatches(this._rings, this._latlngs);
+		if (!reuseRings) {
+			this._rings = [];
+		}
+
 		let cacheIdx = 0;
-		this._projectLatlngs(this._latlngs, this._rings, pxBounds, this._projCache, () => cacheIdx++);
+		let ringIdx = 0;
+		this._projectLatlngs(
+			this._latlngs,
+			this._rings,
+			pxBounds,
+			this._projCache,
+			() => cacheIdx++,
+			reuseRings ? this._rings : null,
+			() => ringIdx++
+		);
 		if (this._bounds.isValid() && pxBounds.isValid()) {
 			this._rawPxBounds = pxBounds;
 			this._updateBounds();
 		}
+	}
+
+	// Returns true when existing _rings has the same nested ring/vertex layout as latlngs.
+	_ringsStructureMatches(rings, latlngs) {
+		if (!rings?.length || !latlngs.length) {
+			return false;
+		}
+
+		let ringIdx = 0;
+		return this._ringsStructureMatchesRecursive(rings, latlngs, () => ringIdx++).match;
+	}
+
+	_ringsStructureMatchesRecursive(rings, latlngs, nextRingIdx) {
+		const flat = latlngs[0] instanceof LatLng;
+
+		if (flat) {
+			const ring = rings[nextRingIdx()];
+			return {match: !!ring && ring.length === latlngs.length};
+		}
+
+		for (let i = 0, len = latlngs.length; i < len; i++) {
+			const result = this._ringsStructureMatchesRecursive(rings, latlngs[i], nextRingIdx);
+			if (!result.match) {
+				return result;
+			}
+		}
+
+		return {match: true};
 	}
 
 	// Build zoom-invariant projected coordinates (CRS projection only).
@@ -237,32 +281,72 @@ export class Polyline extends Path {
 	}
 
 	// recursively turns latlngs into a set of rings with projected coordinates
-	_projectLatlngs(latlngs, result, projectedBounds, cache, nextCacheIdx) {
+	// Optional cache args enable the projection cache; when absent, fall back to the
+	// legacy latLngToLayerPoint path so plugin subclasses using the old 3-arg form keep working.
+	_projectLatlngs(latlngs, result, projectedBounds, cache, nextCacheIdx, existingRings, nextRingIdx) {
 		const flat = latlngs[0] instanceof LatLng;
 
 		if (flat) {
+			if (!cache) {
+				const ring = latlngs.map(latlng => this._map.latLngToLayerPoint(latlng));
+				ring.forEach(r => projectedBounds.extend(r));
+				result.push(ring);
+				return;
+			}
+
 			const map = this._map;
 			const crs = map.options.crs;
 			const scale = crs.scale(map._zoom);
 			const transformation = crs.transformation;
 			const pixelOrigin = map.getPixelOrigin();
 			const ringCache = cache[nextCacheIdx()];
-			const ring = [];
+			const existingRing = existingRings?.[nextRingIdx()];
+			// Reuse and mutate existing Point instances when ring layout is unchanged.
+			// Safe because _parts is always rebuilt from _rings in _update() → _clipPoints()
+			// in the same synchronous turn after _project() (Canvas/SVG._updatePath), or on the
+			// immediately following moveend after Renderer._onZoomEnd; clipSegment's trivial
+			// accept shares the same Point references, so in-place updates stay consistent.
+			const reuseRing = existingRing && existingRing.length === latlngs.length;
+			const ring = reuseRing ? existingRing : [];
+			const a = transformation._a;
+			const b = transformation._b;
+			const c = transformation._c;
+			const d = transformation._d;
+			const originX = pixelOrigin.x;
+			const originY = pixelOrigin.y;
 
 			for (let i = 0, len = latlngs.length; i < len; i++) {
-				const projectedPoint = transformation._transform(
-					new Point(ringCache[i * 2], ringCache[i * 2 + 1]),
-					scale
-				)._round();
-				const pt = projectedPoint._subtract(pixelOrigin);
-				ring.push(pt);
-				projectedBounds.extend(pt);
+				const cx = ringCache[i * 2];
+				const cy = ringCache[i * 2 + 1];
+				const x = Math.round(scale * (a * cx + b)) - originX;
+				const y = Math.round(scale * (c * cy + d)) - originY;
+
+				if (reuseRing) {
+					const pt = ring[i];
+					pt.x = x;
+					pt.y = y;
+					projectedBounds.extend(pt);
+				} else {
+					const pt = new Point(x, y);
+					ring.push(pt);
+					projectedBounds.extend(pt);
+				}
 			}
 
-			result.push(ring);
+			if (!reuseRing) {
+				result.push(ring);
+			}
 		} else {
 			for (let i = 0, len = latlngs.length; i < len; i++) {
-				this._projectLatlngs(latlngs[i], result, projectedBounds, cache, nextCacheIdx);
+				this._projectLatlngs(
+					latlngs[i],
+					result,
+					projectedBounds,
+					cache,
+					nextCacheIdx,
+					existingRings,
+					nextRingIdx
+				);
 			}
 		}
 	}

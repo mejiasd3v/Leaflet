@@ -1,6 +1,17 @@
 import {expect} from 'chai';
-import {LeafletMap, Polyline} from 'leaflet';
+import {LatLng, LeafletMap, Polyline, SimpleCRS} from 'leaflet';
 import {createContainer, removeMapContainer} from '../../SpecHelper.js';
+
+function isFlatLatLngs(latlngs) {
+	return !latlngs.length || latlngs[0] instanceof LatLng || typeof latlngs[0][0] === 'number';
+}
+
+function expectedRings(map, latlngs) {
+	if (isFlatLatLngs(latlngs)) {
+		return [latlngs.map(ll => map.latLngToLayerPoint(ll))];
+	}
+	return latlngs.map(ring => ring.map(ll => map.latLngToLayerPoint(ll)));
+}
 
 function expectRingsEqual(ringsA, ringsB) {
 	expect(ringsA.length).to.equal(ringsB.length);
@@ -10,11 +21,6 @@ function expectRingsEqual(ringsA, ringsB) {
 			expect(ringsA[i][j]).to.eql(ringsB[i][j]);
 		}
 	}
-}
-
-function referenceRings(map, latlngs) {
-	const reference = new Polyline(latlngs).addTo(map);
-	return reference._rings;
 }
 
 describe('Polyline projection cache', () => {
@@ -37,12 +43,12 @@ describe('Polyline projection cache', () => {
 		map.setZoom(8);
 		expect(polyline._projCacheValid).to.be.true;
 		expect(polyline._projCache).to.equal(cache);
-		expectRingsEqual(polyline._rings, referenceRings(map, latlngs));
+		expectRingsEqual(polyline._rings, expectedRings(map, latlngs));
 
 		map.setZoom(12);
 		expect(polyline._projCacheValid).to.be.true;
 		expect(polyline._projCache).to.equal(cache);
-		expectRingsEqual(polyline._rings, referenceRings(map, latlngs));
+		expectRingsEqual(polyline._rings, expectedRings(map, latlngs));
 	});
 
 	it('invalidates the cache when setLatLngs is called', () => {
@@ -55,7 +61,7 @@ describe('Polyline projection cache', () => {
 		polyline.setLatLngs(updatedLatLngs);
 
 		expect(polyline._projCacheValid).to.be.true;
-		expectRingsEqual(polyline._rings, referenceRings(map, updatedLatLngs));
+		expectRingsEqual(polyline._rings, expectedRings(map, updatedLatLngs));
 	});
 
 	it('invalidates the cache when coordinates are mutated in place and redraw is called', () => {
@@ -68,7 +74,27 @@ describe('Polyline projection cache', () => {
 		polyline.redraw();
 
 		expect(polyline._projCache).to.not.equal(cache);
-		const mutatedLatLngs = polyline._latlngs.map(ll => [ll.lat, ll.lng]);
-		expectRingsEqual(polyline._rings, referenceRings(map, mutatedLatLngs));
+		expectRingsEqual(polyline._rings, expectedRings(map, polyline._latlngs));
+	});
+
+	it('rebuilds the cache when moved to a map with a different CRS', () => {
+		const latlngs = [[10, 10], [20, 20], [30, 10]];
+		const polyline = new Polyline(latlngs).addTo(map);
+
+		map.removeLayer(polyline);
+
+		const simpleContainer = createContainer();
+		const simpleMap = new LeafletMap(simpleContainer, {
+			crs: SimpleCRS,
+			center: [0, 0],
+			zoom: 0
+		});
+
+		polyline.addTo(simpleMap);
+
+		expect(polyline._projCacheProjection).to.equal(SimpleCRS.projection);
+		expectRingsEqual(polyline._rings, expectedRings(simpleMap, latlngs));
+
+		removeMapContainer(simpleMap, simpleContainer);
 	});
 });
