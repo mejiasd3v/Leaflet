@@ -62,15 +62,21 @@ describe('Canvas Path2D cache pixel equivalence', () => {
 			stroke: false
 		};
 
+		const markers = [];
 		for (let i = 0; i < 50; i++) {
 			const angle = (i / 50) * Math.PI * 2;
-			new CircleMarker([
+			markers.push(new CircleMarker([
 				Math.cos(angle) * 0.001,
 				Math.sin(angle) * 0.001
-			], style).addTo(map);
+			], style).addTo(map));
 		}
 
 		expectCacheMatchesUncachedForMap();
+		renderPixels(map._renderer, false);
+		renderPixels(map._renderer, false);
+		for (const marker of markers) {
+			expect(marker._path2d).to.be.undefined;
+		}
 	});
 
 	it('matches uncached pixels for overlapping polygons with holes', () => {
@@ -94,19 +100,24 @@ describe('Canvas Path2D cache pixel equivalence', () => {
 	});
 
 	it('matches uncached pixels for interleaved styles', () => {
+		const markers = [];
 		for (let i = 0; i < 40; i++) {
 			const lat = (i % 8) * 0.01;
 			const lng = Math.floor(i / 8) * 0.01;
-			new CircleMarker([lat, lng], {
+			markers.push(new CircleMarker([lat, lng], {
 				radius: 6,
 				fill: true,
 				fillColor: i % 2 ? '#ff0000' : '#0000ff',
 				fillOpacity: 0.8,
 				stroke: false
-			}).addTo(map);
+			}).addTo(map));
 		}
 
 		expectCacheMatchesUncachedForMap();
+		renderPixels(map._renderer, false);
+		for (const marker of markers) {
+			expect(marker._path2d).to.be.undefined;
+		}
 	});
 
 	it('matches uncached pixels for mixed batchable and custom _updatePath layers', () => {
@@ -152,12 +163,14 @@ describe('Canvas Path2D cache pixel equivalence', () => {
 
 	it('matches uncached pixels after setZoom', () => {
 		new Polyline([[0, 0], [0.05, 0.05]], {weight: 2, color: '#ff0000'}).addTo(map);
-		new CircleMarker([0.02, 0.02], {radius: 8, fill: true, fillColor: '#0000ff'}).addTo(map);
+		const marker = new CircleMarker([0.02, 0.02], {radius: 8, fill: true, fillColor: '#0000ff'}).addTo(map);
 
 		expectCacheMatchesUncachedForMap();
 
 		map.setZoom(10);
 		expectCacheMatchesUncachedForMap();
+		renderPixels(map._renderer, false);
+		expect(marker._path2d).to.be.undefined;
 	});
 
 	it('matches uncached pixels after pan re-clips geometry', () => {
@@ -188,6 +201,8 @@ describe('Canvas Path2D cache pixel equivalence', () => {
 
 		marker.setRadius(25);
 		expectCacheMatchesUncachedForMap();
+		renderPixels(map._renderer, false);
+		expect(marker._path2d).to.be.undefined;
 	});
 
 	it('matches uncached pixels after setStyle weight change without geometry invalidation', () => {
@@ -196,11 +211,37 @@ describe('Canvas Path2D cache pixel equivalence', () => {
 			color: '#3388ff'
 		}).addTo(map);
 
-		// Warm the cache with a geometry-stable redraw.
+		// Draw 1: direct emission, warm flag only.
+		renderPixels(map._renderer, false);
+		expect(polyline._path2d).to.be.undefined;
+		expect(polyline._path2dWarm).to.be.true;
+
+		// Draw 2: geometry stable, Path2D retained.
 		renderPixels(map._renderer, false);
 		expect(polyline._path2d).to.exist;
 
 		polyline.setStyle({weight: 8});
+		expect(polyline._path2d).to.exist;
+		expectCacheMatchesUncachedForMap();
+	});
+
+	it('allocates no Path2D on first draw after invalidation, then caches on second', () => {
+		const polyline = new Polyline([[0, 0], [0.02, 0.02], [0.04, 0]], {
+			weight: 3,
+			color: '#3388ff'
+		}).addTo(map);
+
+		renderPixels(map._renderer, false);
+		renderPixels(map._renderer, false);
+		expect(polyline._path2d).to.exist;
+
+		polyline.setLatLngs([[0.01, 0.01], [0.03, 0.03], [0.05, 0.01]]);
+		renderPixels(map._renderer, false);
+		expect(polyline._path2d).to.be.undefined;
+		expect(polyline._path2dWarm).to.be.true;
+
+		renderPixels(map._renderer, false);
+		expect(polyline._path2d).to.exist;
 		expectCacheMatchesUncachedForMap();
 	});
 
@@ -235,6 +276,9 @@ describe('Canvas Path2D cache pixel equivalence', () => {
 		}).addTo(map);
 
 		expectCacheMatchesUncached(canvas);
+		renderPixels(canvas, false);
+		expect(bottom._path2d).to.be.undefined;
+		expect(top._path2d).to.be.undefined;
 
 		const center = map.latLngToLayerPoint([0, 0]);
 		const image = getCanvasImageData(canvas);
