@@ -19,6 +19,11 @@ function mean(values) {
 	return values.reduce((sum, v) => sum + v, 0) / values.length;
 }
 
+function withinNoise(batched, unbatched, tolerance = 0.05) {
+	if (unbatched === 0) { return batched === 0; }
+	return Math.abs(batched - unbatched) / unbatched <= tolerance;
+}
+
 function benchRedraw(renderer, iterations) {
 	const times = new Array(iterations);
 	for (let i = 0; i < iterations; i++) {
@@ -163,5 +168,17 @@ describe('Canvas batch draw benchmark', () => {
 	it('benchmark table', () => {
 		console.info('BENCH_TABLE', JSON.stringify(benchResults));
 		expect(benchResults).to.have.length(3);
+
+		const alternating = benchResults.find(r => r.scenario === 'alternating-style');
+		const overlap = benchResults.find(r => r.scenario === 'overlap-heavy');
+
+		expect(
+			withinNoise(alternating.batched_median_ms, alternating.unbatched_median_ms),
+			`alternating batched ${alternating.batched_median_ms} vs unbatched ${alternating.unbatched_median_ms}`
+		).to.be.true;
+		expect(
+			withinNoise(overlap.batched_median_ms, overlap.unbatched_median_ms),
+			`overlap batched ${overlap.batched_median_ms} vs unbatched ${overlap.unbatched_median_ms}`
+		).to.be.true;
 	});
 });
